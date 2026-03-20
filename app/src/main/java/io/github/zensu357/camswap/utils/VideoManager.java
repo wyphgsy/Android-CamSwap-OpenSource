@@ -6,6 +6,7 @@ import android.net.Uri;
 import android.os.Bundle;
 
 import io.github.zensu357.camswap.ConfigManager;
+import io.github.zensu357.camswap.IpcContract;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -97,8 +98,7 @@ public class VideoManager {
         // directly.
 
         try {
-            Uri uri = Uri.parse("content://io.github.zensu357.camswap.provider/video");
-            ParcelFileDescriptor pfd = toast_content.getContentResolver().openFileDescriptor(uri, "r");
+            ParcelFileDescriptor pfd = toast_content.getContentResolver().openFileDescriptor(IpcContract.URI_VIDEO, "r");
             if (pfd != null) {
                 log("【CS】getVideoPFD: 成功获取 PFD");
             } else {
@@ -137,6 +137,80 @@ public class VideoManager {
             log("【CS】[Private] 视频拷贝完成 (" + size + " bytes)");
         } catch (Exception e) {
             log("【CS】[Private] 视频拷贝失败: " + e);
+        }
+    }
+
+    /**
+     * 通过 ContentProvider 获取音频文件的 PFD。
+     * 使用统一的 Provider audio 路径。
+     */
+    public static ParcelFileDescriptor getAudioPFD() {
+        if (toast_content == null) {
+            return null;
+        }
+        try {
+            ParcelFileDescriptor pfd = toast_content.getContentResolver().openFileDescriptor(IpcContract.URI_AUDIO, "r");
+            if (pfd != null) {
+                log("【CS】getAudioPFD: 成功获取音频 PFD");
+            }
+            return pfd;
+        } catch (Exception e) {
+            log("【CS】getAudioPFD 失败: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * 将音频文件从 Provider 拷贝到 app 私有目录。
+     * @return 拷贝后的私有目录音频文件路径，失败返回 null
+     */
+    public static String copyAudioToPrivateDir() {
+        if (toast_content == null) return null;
+
+        String selectedAudio = getConfig().getString(
+                ConfigManager.KEY_SELECTED_AUDIO, null);
+        if (selectedAudio == null || selectedAudio.isEmpty()) {
+            log("【CS】[Private] 无选中音频文件，跳过音频拷贝");
+            return null;
+        }
+
+        // 使用固定的私有文件名避免特殊字符问题
+        File privateAudio = new File(toast_content.getFilesDir(), "vcam_private_audio");
+
+        ParcelFileDescriptor pfd = null;
+        try {
+            pfd = getAudioPFD();
+            if (pfd == null) {
+                log("【CS】[Private] 无法获取音频 PFD");
+                return null;
+            }
+
+            long size = pfd.getStatSize();
+            if (privateAudio.exists() && privateAudio.length() == size) {
+                log("【CS】[Private] 音频文件大小一致，跳过拷贝 (" + size + " bytes)");
+                return privateAudio.getAbsolutePath();
+            }
+
+            log("【CS】[Private] 开始拷贝音频到私有目录 (" + size + " bytes)...");
+            java.io.FileInputStream fis = new java.io.FileInputStream(pfd.getFileDescriptor());
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(privateAudio);
+
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = fis.read(buf)) > 0) {
+                fos.write(buf, 0, len);
+            }
+            fos.close();
+            fis.close();
+            log("【CS】[Private] 音频拷贝完成 (" + size + " bytes)");
+            return privateAudio.getAbsolutePath();
+        } catch (Exception e) {
+            log("【CS】[Private] 音频拷贝失败: " + e);
+            return null;
+        } finally {
+            if (pfd != null) {
+                try { pfd.close(); } catch (Exception ignored) {}
+            }
         }
     }
 
@@ -180,8 +254,7 @@ public class VideoManager {
 
                 // Try from provider implicitly if needed
                 try {
-                    Uri uri = Uri.parse("content://io.github.zensu357.camswap.provider/video");
-                    ParcelFileDescriptor providerPfd = toast_content.getContentResolver().openFileDescriptor(uri, "r");
+                    ParcelFileDescriptor providerPfd = toast_content.getContentResolver().openFileDescriptor(IpcContract.URI_VIDEO, "r");
                     if (providerPfd != null) {
                         copyToPrivateDir(providerPfd);
                         try {
@@ -204,8 +277,8 @@ public class VideoManager {
                 // Try to trigger random update via provider first if needed
                 if (forceRandom && config.getBoolean(ConfigManager.KEY_ENABLE_RANDOM_PLAY, false)) {
                     try {
-                        toast_content.getContentResolver().call(Uri.parse("content://io.github.zensu357.camswap.provider"),
-                                "random", null, null);
+                        toast_content.getContentResolver().call(IpcContract.CONTENT_URI,
+                                IpcContract.METHOD_RANDOM, null, null);
                     } catch (Exception e) {
                         // log("【CS】Provider random failed: " + e);
                     }
@@ -317,9 +390,9 @@ public class VideoManager {
         if (toast_content != null) {
             try {
                 Bundle res = toast_content.getContentResolver().call(
-                        Uri.parse("content://io.github.zensu357.camswap.provider"),
-                        next ? "next" : "prev", null, null);
-                if (res != null && res.getBoolean("changed")) {
+                        IpcContract.CONTENT_URI,
+                        next ? IpcContract.METHOD_NEXT : IpcContract.METHOD_PREV, null, null);
+                if (res != null && res.getBoolean(IpcContract.EXTRA_CHANGED)) {
                     return true;
                 }
             } catch (Exception e) {

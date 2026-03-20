@@ -5,7 +5,8 @@ plugins {
 
 android {
     namespace 'io.github.zensu357.camswap'
-    compileSdk 34
+    compileSdk 36
+    ndkVersion '25.1.8937393'
 
     // Auto-versioning logic
     def date = new Date()
@@ -32,9 +33,9 @@ android {
     defaultConfig {
         applicationId "io.github.zensu357.camswap"
         minSdk 26
-        targetSdk 34
+        targetSdk 36
         versionCode versionCodeInt
-        versionName "2.3.${versionSuffix}"
+        versionName "2.4.${versionSuffix}"
         
         // Inject build time into BuildConfig
         buildConfigField "String", "BUILD_TIME", "\"${buildTime}\""
@@ -58,8 +59,14 @@ android {
         kotlinCompilerExtensionVersion '1.5.1'
     }
 
+    packaging {
+        resources {
+            merges += ['META-INF/xposed/*']
+        }
+    }
+
     kotlinOptions {
-        jvmTarget = '1.8'
+        jvmTarget = '17'
     }
 
     buildTypes {
@@ -73,10 +80,13 @@ android {
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+        debug {
+            minifyEnabled false
+        }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     externalNativeBuild {
@@ -97,8 +107,7 @@ android {
 }
 
 dependencies {
-    compileOnly 'de.robv.android.xposed:api:82'
-    compileOnly 'de.robv.android.xposed:api:82:sources'
+    compileOnly 'io.github.libxposed:api:101.0.0'
     
     // Core Dependencies
     implementation 'androidx.core:core-ktx:1.10.1'
@@ -120,7 +129,6 @@ dependencies {
     testImplementation 'org.mockito:mockito-core:4.11.0'
     testImplementation 'org.mockito:mockito-inline:4.11.0'
     testImplementation 'org.json:json:20231013'
-    testImplementation 'de.robv.android.xposed:api:82'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
     androidTestImplementation platform('androidx.compose:compose-bom:2023.08.00')

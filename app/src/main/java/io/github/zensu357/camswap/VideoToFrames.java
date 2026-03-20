@@ -17,7 +17,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.LinkedBlockingQueue;
 
-import de.robv.android.xposed.XposedBridge;
 import io.github.zensu357.camswap.utils.LogUtil;
 
 public class VideoToFrames implements Runnable {

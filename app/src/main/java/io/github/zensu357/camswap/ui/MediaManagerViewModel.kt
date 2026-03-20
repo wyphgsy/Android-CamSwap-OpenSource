@@ -17,6 +17,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import io.github.zensu357.camswap.ConfigManager
+import io.github.zensu357.camswap.IpcContract
 import io.github.zensu357.camswap.utils.ImageToVideoConverter
 
 
@@ -195,7 +196,7 @@ class MediaManagerViewModel(application: Application) : AndroidViewModel(applica
                     }
                     try {
                         getApplication<Application>().contentResolver.notifyChange(
-                            Uri.parse("content://io.github.zensu357.camswap.provider/config"), null)
+                            IpcContract.URI_CONFIG, null)
                     } catch (_: Exception) {}
                     loadMedia()
                 }
@@ -281,7 +282,7 @@ class MediaManagerViewModel(application: Application) : AndroidViewModel(applica
                             _uiState.update { it.copy(selectedVideoName = convertedFile.name) }
                             try {
                                 context.contentResolver.notifyChange(
-                                    Uri.parse("content://io.github.zensu357.camswap.provider/config"), null)
+                                    IpcContract.URI_CONFIG, null)
                             } catch (_: Exception) {}
                         } else {
                             android.util.Log.e("CamSwap", "图片转视频失败! convertedFile=$convertedFile")

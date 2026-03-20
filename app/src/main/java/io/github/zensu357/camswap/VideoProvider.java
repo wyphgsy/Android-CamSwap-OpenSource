@@ -17,15 +17,6 @@ import java.util.concurrent.ThreadLocalRandom;
 import io.github.zensu357.camswap.utils.VideoManager;
 
 public class VideoProvider extends ContentProvider {
-    public static final String AUTHORITY = "io.github.zensu357.camswap.provider";
-    public static final Uri CONTENT_URI = Uri.parse("content://" + AUTHORITY);
-    public static final String PATH_VIDEO = "video";
-    public static final String PATH_CONFIG = "config";
-    public static final Uri URI_CONFIG = Uri.withAppendedPath(CONTENT_URI, PATH_CONFIG);
-    public static final String METHOD_NEXT = "next";
-    public static final String METHOD_PREV = "prev";
-    public static final String METHOD_RANDOM = "random";
-
     private ConfigManager configManager;
 
     @Override
@@ -56,7 +47,7 @@ public class VideoProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
         String lastPathSegment = uri.getLastPathSegment();
-        if (PATH_CONFIG.equals(lastPathSegment)) {
+        if (IpcContract.PATH_CONFIG.equals(lastPathSegment)) {
             configManager.reload();
             // If configData is still empty after reload, try force reload once more
             org.json.JSONObject data = configManager.getConfigData();
@@ -116,8 +107,15 @@ public class VideoProvider extends ContentProvider {
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
         configManager.reload();
 
+        String lastSeg = uri.getLastPathSegment();
+
+        // Handle audio file request
+        if (IpcContract.PATH_AUDIO.equals(lastSeg)) {
+            return openAudioFile();
+        }
+
         // Try to start service if enabled (Lazy load when video is accessed)
-        if (configManager.getBoolean("notification_control_enabled", false)) {
+        if (configManager.getBoolean(ConfigManager.KEY_NOTIFICATION_CONTROL_ENABLED, false)) {
             try {
                 android.content.Context context = getContext();
                 if (context != null) {
@@ -185,32 +183,82 @@ public class VideoProvider extends ContentProvider {
         }
     }
 
+    /**
+     * 打开音频文件并返回 PFD。
+     * 查找逻辑：selected_audio → Mic.mp3 → 目录中任意音频文件。
+     */
+    private ParcelFileDescriptor openAudioFile() throws FileNotFoundException {
+        File audioDir = new File(ConfigManager.DEFAULT_CONFIG_DIR);
+        String selectedAudio = configManager.getString(ConfigManager.KEY_SELECTED_AUDIO, null);
+
+        File audioFile = null;
+
+        // 1. 使用配置中选中的音频
+        if (selectedAudio != null && !selectedAudio.isEmpty()) {
+            audioFile = new File(audioDir, selectedAudio);
+            Log.d("VideoProvider", "openAudioFile: trying selected=" + audioFile.getAbsolutePath()
+                    + " exists=" + audioFile.exists());
+        }
+
+        // 2. 降级到 Mic.mp3
+        if (audioFile == null || !audioFile.exists()) {
+            audioFile = new File(audioDir, "Mic.mp3");
+            Log.d("VideoProvider", "openAudioFile: fallback to Mic.mp3 exists=" + audioFile.exists());
+        }
+
+        // 3. 扫描目录中任意音频文件
+        if (!audioFile.exists()) {
+            File[] files = audioDir.listFiles((dir, name) -> {
+                String lower = name.toLowerCase();
+                return lower.endsWith(".mp3") || lower.endsWith(".wav")
+                        || lower.endsWith(".aac") || lower.endsWith(".m4a")
+                        || lower.endsWith(".ogg") || lower.endsWith(".flac");
+            });
+            if (files != null && files.length > 0) {
+                audioFile = files[0];
+                Log.d("VideoProvider", "openAudioFile: found audio file=" + audioFile.getName());
+            }
+        }
+
+        if (audioFile == null || !audioFile.exists()) {
+            Log.e("VideoProvider", "No audio file found in " + audioDir.getAbsolutePath());
+            throw new FileNotFoundException("No audio file found in " + audioDir.getAbsolutePath());
+        }
+
+        Log.d("VideoProvider", "openAudioFile: opening " + audioFile.getAbsolutePath());
+        try {
+            return ParcelFileDescriptor.open(audioFile, ParcelFileDescriptor.MODE_READ_ONLY);
+        } catch (Exception e) {
+            throw new FileNotFoundException(
+                    "Cannot open audio file: " + audioFile.getAbsolutePath() + " - " + e.getMessage());
+        }
+    }
+
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
         configManager.reload();
         boolean changed = false;
 
         try {
-            if (METHOD_NEXT.equals(method)) {
+            if (IpcContract.METHOD_NEXT.equals(method)) {
                 changed = switchVideo(true);
-            } else if (METHOD_PREV.equals(method)) {
+            } else if (IpcContract.METHOD_PREV.equals(method)) {
                 changed = switchVideo(false);
-            } else if (METHOD_RANDOM.equals(method)) {
+            } else if (IpcContract.METHOD_RANDOM.equals(method)) {
                 changed = pickRandomVideo();
             }
 
             if (changed) {
                 // Notify both video and config URIs to ensure listeners are updated
-                getContext().getContentResolver().notifyChange(
-                        android.net.Uri.parse("content://" + AUTHORITY + "/" + PATH_VIDEO), null);
-                getContext().getContentResolver().notifyChange(URI_CONFIG, null);
+                getContext().getContentResolver().notifyChange(IpcContract.URI_VIDEO, null);
+                getContext().getContentResolver().notifyChange(IpcContract.URI_CONFIG, null);
             }
         } catch (Exception e) {
             Log.e("VideoProvider", "Error in call method: " + method, e);
         }
 
         Bundle result = new Bundle();
-        result.putBoolean("changed", changed);
+        result.putBoolean(IpcContract.EXTRA_CHANGED, changed);
         return result;
     }
 

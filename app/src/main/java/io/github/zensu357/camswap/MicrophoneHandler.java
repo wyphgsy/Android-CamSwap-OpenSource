@@ -1,18 +1,21 @@
 package io.github.zensu357.camswap;
 
 import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.media.MediaPlayer;
 import android.os.Build;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import io.github.libxposed.api.XposedInterface;
+import io.github.zensu357.camswap.api101.Api101Runtime;
 
 import io.github.zensu357.camswap.utils.AudioDataProvider;
 import io.github.zensu357.camswap.utils.LogUtil;
@@ -35,6 +38,9 @@ public class MicrophoneHandler implements ICameraHandler {
 
     // 方案 B 时长校验：是否已提醒过用户
     private static volatile boolean durationWarningShown = false;
+
+    // 诊断日志计数器：audioPath 为 null 时限制日志数量
+    private static volatile int audioPathNullLogCount = 0;
 
     // 视频同步模式：记住上次已知的播放位置，避免播放器暂时不可用时回退到 0
     private static volatile long lastKnownPlaybackPositionMs = 0;
@@ -116,8 +122,15 @@ public class MicrophoneHandler implements ICameraHandler {
             return false;
         }
         String audioPath = AudioDataProvider.getAudioFilePath();
-        if (audioPath == null)
+        if (audioPath == null) {
+            // 仅在前 3 次打印此日志，避免日志洪泛
+            if (audioPathNullLogCount < 3) {
+                audioPathNullLogCount++;
+                LogUtil.log(TAG + " ⚠ isReplaceMode: audioPath 为 null，音频文件未找到！"
+                        + " video_path=" + VideoManager.video_path);
+            }
             return false;
+        }
 
         // 检查是否需要（重新）加载：未就绪 或 文件已切换
         String loadedPath = AudioDataProvider.getCurrentFilePath();
@@ -156,7 +169,8 @@ public class MicrophoneHandler implements ICameraHandler {
      * 异步预加载音频数据（根据当前模式决定加载什么文件）
      */
     private static void preloadAudioAsync() {
-        if (!isMicHookEnabled()) return;
+        if (!isMicHookEnabled())
+            return;
         String mode = getMicHookMode();
         String pathToLoad = null;
         if (ConfigManager.MIC_MODE_REPLACE.equals(mode)) {
@@ -174,12 +188,14 @@ public class MicrophoneHandler implements ICameraHandler {
      * 使用 asyncLoadingInProgress 标记防止重复提交。
      */
     private static void preloadAudioFileAsync(final String filePath) {
-        if (filePath == null) return;
+        if (filePath == null)
+            return;
         // 已经加载了同一文件，无需重复
         if (filePath.equals(AudioDataProvider.getCurrentFilePath()) && AudioDataProvider.isReady()) {
             return;
         }
-        if (!asyncLoadingInProgress.compareAndSet(false, true)) return;
+        if (!asyncLoadingInProgress.compareAndSet(false, true))
+            return;
 
         new Thread(new Runnable() {
             @Override
@@ -233,9 +249,10 @@ public class MicrophoneHandler implements ICameraHandler {
             return params;
         // 回退：尝试从 AudioRecord 实例动态获取参数
         try {
-            int sampleRate = (int) XposedHelpers.callMethod(audioRecord, "getSampleRate");
-            int channelConfig = (int) XposedHelpers.callMethod(audioRecord, "getChannelConfiguration");
-            int audioFormat = (int) XposedHelpers.callMethod(audioRecord, "getAudioFormat");
+            AudioRecord typedRecord = (AudioRecord) audioRecord;
+            int sampleRate = typedRecord.getSampleRate();
+            int channelConfig = typedRecord.getChannelConfiguration();
+            int audioFormat = typedRecord.getAudioFormat();
             params = new AudioRecordParams(0, sampleRate, channelConfig, audioFormat, 4096);
             recordParamsMap.put(audioRecord, params);
             LogUtil.log(TAG + " 动态获取 AudioRecord 参数: sampleRate=" + sampleRate
@@ -315,357 +332,354 @@ public class MicrophoneHandler implements ICameraHandler {
         preloadAudioAsync();
     }
 
+    private static void replaceByteArrayResult(Object audioRecord, byte[] buffer, int offset, int result,
+            String methodTag) {
+        if (!isMicHookEnabled() || result <= 0 || buffer == null) {
+            return;
+        }
+        AudioRecordParams p = getParams(audioRecord);
+
+        logReadCall(result, methodTag);
+
+        if (isVideoSyncMode()) {
+            long posMs = getVideoPlaybackPositionMs();
+            AudioDataProvider.fillBytesAtPosition(buffer, offset, result,
+                    p.sampleRate, p.channelCount, posMs);
+        } else if (isReplaceMode()) {
+            AudioDataProvider.fillBytes(buffer, offset, result,
+                    p.sampleRate, p.channelCount);
+        } else {
+            Arrays.fill(buffer, offset, offset + result, (byte) 0);
+        }
+    }
+
+    private static void replaceShortArrayResult(Object audioRecord, short[] buffer, int offset, int result,
+            String methodTag) {
+        if (!isMicHookEnabled() || result <= 0 || buffer == null) {
+            return;
+        }
+        AudioRecordParams p = getParams(audioRecord);
+
+        logReadCall(result, methodTag);
+
+        if (isVideoSyncMode()) {
+            long posMs = getVideoPlaybackPositionMs();
+            AudioDataProvider.fillShortsAtPosition(buffer, offset, result,
+                    p.sampleRate, p.channelCount, posMs);
+        } else if (isReplaceMode()) {
+            AudioDataProvider.fillShorts(buffer, offset, result,
+                    p.sampleRate, p.channelCount);
+        } else {
+            Arrays.fill(buffer, offset, offset + result, (short) 0);
+        }
+    }
+
     // ================================================================
     // Hook 初始化
     // ================================================================
 
     @Override
-    public void init(final XC_LoadPackage.LoadPackageParam lpparam) {
+    public void init(final Api101PackageContext packageContext) {
+        final ClassLoader classLoader = packageContext.classLoader;
         LogUtil.log(TAG + " 初始化麦克风 Hook");
 
-        // ============================================================
-        // 1. Hook AudioRecord 构造函数 — 捕获参数 + 预加载音频
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookConstructor(
-                    "android.media.AudioRecord", lpparam.classLoader,
-                    int.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            int audioSource = (int) param.args[0];
-                            int sampleRate = (int) param.args[1];
-                            int channelConfig = (int) param.args[2];
-                            int audioFormat = (int) param.args[3];
-                            int bufferSize = (int) param.args[4];
-
-                            LogUtil.log(TAG + " AudioRecord 创建: audioSource=" + audioSource
-                                    + " sampleRate=" + sampleRate
-                                    + " channelConfig=" + channelConfig
-                                    + " audioFormat=" + audioFormat
-                                    + " bufferSize=" + bufferSize);
-
-                            AudioRecordParams params = new AudioRecordParams(
-                                    audioSource, sampleRate, channelConfig, audioFormat, bufferSize);
-                            recordParamsMap.put(param.thisObject, params);
-
-                            // 异步预加载音频数据（不阻塞构造线程）
-                            preloadAudioAsync();
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook AudioRecord 构造函数失败: " + t);
-        }
-
-        // ============================================================
-        // 1.5 Hook AudioRecord.Builder.build() — 捕获 Builder 模式创建的 AudioRecord
-        // ============================================================
+        hookAudioRecordConstructor(classLoader);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                XposedHelpers.findAndHookMethod(
-                        "android.media.AudioRecord$Builder", lpparam.classLoader,
-                        "build",
-                        new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                Object audioRecord = param.getResult();
-                                if (audioRecord == null)
-                                    return;
-
-                                try {
-                                    int sampleRate = (int) XposedHelpers.callMethod(audioRecord, "getSampleRate");
-                                    int channelConfig = (int) XposedHelpers.callMethod(audioRecord,
-                                            "getChannelConfiguration");
-                                    int audioFormat = (int) XposedHelpers.callMethod(audioRecord, "getAudioFormat");
-                                    int bufferSize = (int) XposedHelpers.callMethod(audioRecord,
-                                            "getBufferSizeInFrames");
-                                    int audioSource = 0;
-
-                                    LogUtil.log(TAG + " AudioRecord.Builder.build(): sampleRate=" + sampleRate
-                                            + " channelConfig=" + channelConfig
-                                            + " audioFormat=" + audioFormat
-                                            + " bufferSize=" + bufferSize);
-
-                                    AudioRecordParams params = new AudioRecordParams(
-                                            audioSource, sampleRate, channelConfig, audioFormat, bufferSize);
-                                    recordParamsMap.put(audioRecord, params);
-
-                                    // 异步预加载音频数据
-                                    preloadAudioAsync();
-                                } catch (Exception e) {
-                                    LogUtil.log(TAG + " 获取 Builder 创建的 AudioRecord 参数失败: " + e);
-                                }
-                            }
-                        });
-            } catch (Throwable t) {
-                LogUtil.log(TAG + " Hook AudioRecord.Builder.build() 失败: " + t);
-            }
+            hookAudioRecordBuilderBuild(classLoader);
         }
+        hookAudioRecordRelease(classLoader);
+        hookAudioRecordStartRecording(classLoader);
 
-        // ============================================================
-        // 1.6 Hook AudioRecord.release() — 清理参数映射
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.media.AudioRecord", lpparam.classLoader,
-                    "release",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            recordParamsMap.remove(param.thisObject);
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook AudioRecord.release() 失败: " + t);
-        }
-
-        // ============================================================
-        // 1.7 Hook AudioRecord.startRecording() — 确保音频数据在录制前已加载
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.media.AudioRecord", lpparam.classLoader,
-                    "startRecording",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            LogUtil.log(TAG + " AudioRecord.startRecording() 被调用, micHook="
-                                    + isMicHookEnabled() + " mode=" + getMicHookMode());
-                            preloadAudioAsync();
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook AudioRecord.startRecording() 失败: " + t);
-        }
-
-        // ============================================================
-        // 2. Hook AudioRecord.read(byte[], int, int)
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.media.AudioRecord", lpparam.classLoader,
-                    "read", byte[].class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            if (!isMicHookEnabled())
-                                return;
-                            int result = (int) param.getResult();
-                            if (result <= 0)
-                                return;
-
-                            byte[] buffer = (byte[]) param.args[0];
-                            int offset = (int) param.args[1];
-                            AudioRecordParams p = getParams(param.thisObject);
-
-                            logReadCall(result, "byte[]");
-
-                            if (isVideoSyncMode()) {
-                                long posMs = getVideoPlaybackPositionMs();
-                                AudioDataProvider.fillBytesAtPosition(buffer, offset, result,
-                                        p.sampleRate, p.channelCount, posMs);
-                            } else if (isReplaceMode()) {
-                                AudioDataProvider.fillBytes(buffer, offset, result,
-                                        p.sampleRate, p.channelCount);
-                            } else {
-                                Arrays.fill(buffer, offset, offset + result, (byte) 0);
-                            }
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook AudioRecord.read(byte[]) 失败: " + t);
-        }
-
-        // ============================================================
-        // 3. Hook AudioRecord.read(short[], int, int)
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.media.AudioRecord", lpparam.classLoader,
-                    "read", short[].class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            if (!isMicHookEnabled())
-                                return;
-                            int result = (int) param.getResult();
-                            if (result <= 0)
-                                return;
-
-                            short[] buffer = (short[]) param.args[0];
-                            int offset = (int) param.args[1];
-                            AudioRecordParams p = getParams(param.thisObject);
-
-                            logReadCall(result, "short[]");
-
-                            if (isVideoSyncMode()) {
-                                long posMs = getVideoPlaybackPositionMs();
-                                AudioDataProvider.fillShortsAtPosition(buffer, offset, result,
-                                        p.sampleRate, p.channelCount, posMs);
-                            } else if (isReplaceMode()) {
-                                AudioDataProvider.fillShorts(buffer, offset, result,
-                                        p.sampleRate, p.channelCount);
-                            } else {
-                                Arrays.fill(buffer, offset, offset + result, (short) 0);
-                            }
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook AudioRecord.read(short[]) 失败: " + t);
-        }
-
-        // ============================================================
-        // 4. Hook AudioRecord.read(ByteBuffer, int)
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.media.AudioRecord", lpparam.classLoader,
-                    "read", ByteBuffer.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            if (!isMicHookEnabled())
-                                return;
-                            int result = (int) param.getResult();
-                            if (result <= 0)
-                                return;
-
-                            ByteBuffer buffer = (ByteBuffer) param.args[0];
-                            int pos = buffer.position();
-                            AudioRecordParams p = getParams(param.thisObject);
-
-                            logReadCall(result, "ByteBuffer");
-
-                            if (isVideoSyncMode()) {
-                                long posMs = getVideoPlaybackPositionMs();
-                                buffer.position(pos - result);
-                                AudioDataProvider.fillByteBufferAtPosition(buffer, result,
-                                        p.sampleRate, p.channelCount, posMs);
-                                buffer.position(pos);
-                            } else if (isReplaceMode()) {
-                                buffer.position(pos - result);
-                                AudioDataProvider.fillByteBuffer(buffer, result,
-                                        p.sampleRate, p.channelCount);
-                                buffer.position(pos);
-                            } else {
-                                byte[] zeros = new byte[result];
-                                buffer.position(pos - result);
-                                buffer.put(zeros);
-                                buffer.position(pos);
-                            }
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook AudioRecord.read(ByteBuffer, int) 失败: " + t);
-        }
-
-        // ============================================================
-        // 5. Hook AudioRecord.read(float[], int, int, int) — API 23+
-        // ============================================================
+        hookReadByteArray(classLoader);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                XposedHelpers.findAndHookMethod(
-                        "android.media.AudioRecord", lpparam.classLoader,
-                        "read", float[].class, int.class, int.class, int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                if (!isMicHookEnabled())
-                                    return;
-                                int result = (int) param.getResult();
-                                if (result <= 0)
-                                    return;
-
-                                float[] buffer = (float[]) param.args[0];
-                                int offset = (int) param.args[1];
-                                AudioRecordParams p = getParams(param.thisObject);
-
-                                logReadCall(result, "float[]");
-
-                                if (isVideoSyncMode()) {
-                                    long posMs = getVideoPlaybackPositionMs();
-                                    AudioDataProvider.fillFloatsAtPosition(buffer, offset, result,
-                                            p.sampleRate, p.channelCount, posMs);
-                                } else if (isReplaceMode()) {
-                                    AudioDataProvider.fillFloats(buffer, offset, result,
-                                            p.sampleRate, p.channelCount);
-                                } else {
-                                    Arrays.fill(buffer, offset, offset + result, 0.0f);
-                                }
-                            }
-                        });
-            } catch (Throwable t) {
-                LogUtil.log(TAG + " Hook AudioRecord.read(float[]) 失败: " + t);
-            }
+            hookReadByteArrayReadMode(classLoader);
         }
-
-        // ============================================================
-        // 6. Hook AudioRecord.read(ByteBuffer, int, int) — API 23+
-        // ============================================================
+        hookReadShortArray(classLoader);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                XposedHelpers.findAndHookMethod(
-                        "android.media.AudioRecord", lpparam.classLoader,
-                        "read", ByteBuffer.class, int.class, int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                if (!isMicHookEnabled())
-                                    return;
-                                int result = (int) param.getResult();
-                                if (result <= 0)
-                                    return;
-
-                                ByteBuffer buffer = (ByteBuffer) param.args[0];
-                                int pos = buffer.position();
-                                AudioRecordParams p = getParams(param.thisObject);
-
-                                logReadCall(result, "ByteBuffer(int,int)");
-
-                                if (isVideoSyncMode()) {
-                                    long posMs = getVideoPlaybackPositionMs();
-                                    buffer.position(pos - result);
-                                    AudioDataProvider.fillByteBufferAtPosition(buffer, result,
-                                            p.sampleRate, p.channelCount, posMs);
-                                    buffer.position(pos);
-                                } else if (isReplaceMode()) {
-                                    buffer.position(pos - result);
-                                    AudioDataProvider.fillByteBuffer(buffer, result,
-                                            p.sampleRate, p.channelCount);
-                                    buffer.position(pos);
-                                } else {
-                                    byte[] zeros = new byte[result];
-                                    buffer.position(pos - result);
-                                    buffer.put(zeros);
-                                    buffer.position(pos);
-                                }
-                            }
-                        });
-            } catch (Throwable t) {
-                LogUtil.log(TAG + " Hook AudioRecord.read(ByteBuffer, int, int) 失败: " + t);
-            }
+            hookReadShortArrayReadMode(classLoader);
+        }
+        hookReadByteBuffer(classLoader);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            hookReadFloatArray(classLoader);
+            hookReadByteBufferReadMode(classLoader);
         }
 
-        // ============================================================
-        // 7. Hook MediaRecorder.setAudioSource(int) — 日志
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.media.MediaRecorder", lpparam.classLoader,
-                    "setAudioSource", int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            LogUtil.log(TAG + " MediaRecorder.setAudioSource: " + param.args[0]
-                                    + " (micHook=" + isMicHookEnabled()
-                                    + " mode=" + getMicHookMode() + ")");
-                        }
-                    });
-        } catch (Throwable t) {
-            LogUtil.log(TAG + " Hook MediaRecorder.setAudioSource 失败: " + t);
-        }
+        hookMediaRecorderSetAudioSource(classLoader);
 
         LogUtil.log(TAG + " 麦克风 Hook 初始化完成");
+    }
+
+    private void hookAudioRecordConstructor(ClassLoader classLoader) {
+        hookConstructor(classLoader, "android.media.AudioRecord",
+                new Class<?>[] { int.class, int.class, int.class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    try {
+                        int audioSource = (int) args[0];
+                        int sampleRate = (int) args[1];
+                        int channelConfig = (int) args[2];
+                        int audioFormat = (int) args[3];
+                        int bufferSize = (int) args[4];
+
+                        LogUtil.log(TAG + " AudioRecord 创建: audioSource=" + audioSource
+                                + " sampleRate=" + sampleRate
+                                + " channelConfig=" + channelConfig
+                                + " audioFormat=" + audioFormat
+                                + " bufferSize=" + bufferSize);
+
+                        recordParamsMap.put(chain.getThisObject(),
+                                new AudioRecordParams(audioSource, sampleRate, channelConfig, audioFormat, bufferSize));
+                        preloadAudioAsync();
+                    } catch (Throwable t) {
+                        LogUtil.log(TAG + " AudioRecord 构造函数 after 异常: " + t);
+                    }
+                    return result;
+                }, "AudioRecord 构造函数");
+    }
+
+    private void hookAudioRecordBuilderBuild(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord$Builder", "build", new Class<?>[0], chain -> {
+            Object[] args = toArgs(chain.getArgs());
+            Object result = chain.proceed(args);
+            if (!(result instanceof AudioRecord)) {
+                return result;
+            }
+
+            try {
+                AudioRecord typedRecord = (AudioRecord) result;
+                int sampleRate = typedRecord.getSampleRate();
+                int channelConfig = typedRecord.getChannelConfiguration();
+                int audioFormat = typedRecord.getAudioFormat();
+                int bufferSize = typedRecord.getBufferSizeInFrames();
+
+                LogUtil.log(TAG + " AudioRecord.Builder.build(): sampleRate=" + sampleRate
+                        + " channelConfig=" + channelConfig
+                        + " audioFormat=" + audioFormat
+                        + " bufferSize=" + bufferSize);
+
+                recordParamsMap.put(result,
+                        new AudioRecordParams(0, sampleRate, channelConfig, audioFormat, bufferSize));
+                preloadAudioAsync();
+            } catch (Throwable t) {
+                LogUtil.log(TAG + " 获取 Builder 创建的 AudioRecord 参数失败: " + t);
+            }
+            return result;
+        }, "AudioRecord.Builder.build()");
+    }
+
+    private void hookAudioRecordRelease(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "release", new Class<?>[0], chain -> {
+            Object[] args = toArgs(chain.getArgs());
+            Object result = chain.proceed(args);
+            recordParamsMap.remove(chain.getThisObject());
+            return result;
+        }, "AudioRecord.release()");
+    }
+
+    private void hookAudioRecordStartRecording(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "startRecording", new Class<?>[0], chain -> {
+            Object[] args = toArgs(chain.getArgs());
+            try {
+                LogUtil.log(TAG + " AudioRecord.startRecording() 被调用, micHook="
+                        + isMicHookEnabled() + " mode=" + getMicHookMode());
+                preloadAudioAsync();
+            } catch (Throwable t) {
+                LogUtil.log(TAG + " startRecording before 异常: " + t);
+            }
+            return chain.proceed(args);
+        }, "AudioRecord.startRecording()");
+    }
+
+    private void hookReadByteArray(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { byte[].class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceByteArrayResult(chain.getThisObject(), (byte[]) args[0], (int) args[1], intResult(result),
+                            "byte[]");
+                    return result;
+                }, "AudioRecord.read(byte[], int, int)");
+    }
+
+    private void hookReadByteArrayReadMode(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { byte[].class, int.class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceByteArrayResult(chain.getThisObject(), (byte[]) args[0], (int) args[1], intResult(result),
+                            "byte[](readMode)");
+                    return result;
+                }, "AudioRecord.read(byte[], int, int, int)");
+    }
+
+    private void hookReadShortArray(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { short[].class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceShortArrayResult(chain.getThisObject(), (short[]) args[0], (int) args[1], intResult(result),
+                            "short[]");
+                    return result;
+                }, "AudioRecord.read(short[], int, int)");
+    }
+
+    private void hookReadShortArrayReadMode(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { short[].class, int.class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceShortArrayResult(chain.getThisObject(), (short[]) args[0], (int) args[1], intResult(result),
+                            "short[](readMode)");
+                    return result;
+                }, "AudioRecord.read(short[], int, int, int)");
+    }
+
+    private void hookReadByteBuffer(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { ByteBuffer.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceByteBufferResult(chain.getThisObject(), (ByteBuffer) args[0], intResult(result), "ByteBuffer");
+                    return result;
+                }, "AudioRecord.read(ByteBuffer, int)");
+    }
+
+    private void hookReadFloatArray(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { float[].class, int.class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceFloatArrayResult(chain.getThisObject(), (float[]) args[0], (int) args[1], intResult(result),
+                            "float[]");
+                    return result;
+                }, "AudioRecord.read(float[], int, int, int)");
+    }
+
+    private void hookReadByteBufferReadMode(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.AudioRecord", "read",
+                new Class<?>[] { ByteBuffer.class, int.class, int.class }, chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    Object result = chain.proceed(args);
+                    replaceByteBufferResult(chain.getThisObject(), (ByteBuffer) args[0], intResult(result),
+                            "ByteBuffer(int,int)");
+                    return result;
+                }, "AudioRecord.read(ByteBuffer, int, int)");
+    }
+
+    private void hookMediaRecorderSetAudioSource(ClassLoader classLoader) {
+        hookMethod(classLoader, "android.media.MediaRecorder", "setAudioSource", new Class<?>[] { int.class },
+                chain -> {
+                    Object[] args = toArgs(chain.getArgs());
+                    try {
+                        LogUtil.log(TAG + " MediaRecorder.setAudioSource: " + args[0]
+                                + " (micHook=" + isMicHookEnabled()
+                                + " mode=" + getMicHookMode() + ")");
+                    } catch (Throwable t) {
+                        LogUtil.log(TAG + " MediaRecorder.setAudioSource before 异常: " + t);
+                    }
+                    return chain.proceed(args);
+                }, "MediaRecorder.setAudioSource(int)");
+    }
+
+    private static void replaceByteBufferResult(Object audioRecord, ByteBuffer buffer, int result, String methodTag) {
+        if (!isMicHookEnabled() || result <= 0 || buffer == null) {
+            return;
+        }
+        int pos = buffer.position();
+        AudioRecordParams p = getParams(audioRecord);
+
+        logReadCall(result, methodTag);
+
+        if (isVideoSyncMode()) {
+            long posMs = getVideoPlaybackPositionMs();
+            buffer.position(pos - result);
+            AudioDataProvider.fillByteBufferAtPosition(buffer, result,
+                    p.sampleRate, p.channelCount, posMs);
+            buffer.position(pos);
+        } else if (isReplaceMode()) {
+            buffer.position(pos - result);
+            AudioDataProvider.fillByteBuffer(buffer, result,
+                    p.sampleRate, p.channelCount);
+            buffer.position(pos);
+        } else {
+            byte[] zeros = new byte[result];
+            buffer.position(pos - result);
+            buffer.put(zeros);
+            buffer.position(pos);
+        }
+    }
+
+    private static void replaceFloatArrayResult(Object audioRecord, float[] buffer, int offset, int result,
+            String methodTag) {
+        if (!isMicHookEnabled() || result <= 0 || buffer == null) {
+            return;
+        }
+        AudioRecordParams p = getParams(audioRecord);
+
+        logReadCall(result, methodTag);
+
+        if (isVideoSyncMode()) {
+            long posMs = getVideoPlaybackPositionMs();
+            AudioDataProvider.fillFloatsAtPosition(buffer, offset, result,
+                    p.sampleRate, p.channelCount, posMs);
+        } else if (isReplaceMode()) {
+            AudioDataProvider.fillFloats(buffer, offset, result,
+                    p.sampleRate, p.channelCount);
+        } else {
+            Arrays.fill(buffer, offset, offset + result, 0.0f);
+        }
+    }
+
+    private void hookMethod(ClassLoader classLoader, String className, String methodName, Class<?>[] parameterTypes,
+            XposedInterface.Hooker hooker, String label) {
+        try {
+            Method method = resolveMethod(classLoader, className, methodName, parameterTypes);
+            Api101Runtime.requireModule().hook(method).intercept(hooker);
+        } catch (Throwable t) {
+            LogUtil.log(TAG + " Hook " + label + " 失败: " + t);
+        }
+    }
+
+    private void hookConstructor(ClassLoader classLoader, String className, Class<?>[] parameterTypes,
+            XposedInterface.Hooker hooker, String label) {
+        try {
+            Constructor<?> constructor = resolveConstructor(classLoader, className, parameterTypes);
+            Api101Runtime.requireModule().hook(constructor).intercept(hooker);
+        } catch (Throwable t) {
+            LogUtil.log(TAG + " Hook " + label + " 失败: " + t);
+        }
+    }
+
+    private static Method resolveMethod(ClassLoader classLoader, String className, String methodName,
+            Class<?>... parameterTypes) throws Exception {
+        Class<?> clazz = Class.forName(className, false, classLoader);
+        Class<?> current = clazz;
+        while (current != null) {
+            try {
+                Method method = current.getDeclaredMethod(methodName, parameterTypes);
+                method.setAccessible(true);
+                return method;
+            } catch (NoSuchMethodException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchMethodException(className + "#" + methodName);
+    }
+
+    private static Constructor<?> resolveConstructor(ClassLoader classLoader, String className,
+            Class<?>... parameterTypes) throws Exception {
+        Class<?> clazz = Class.forName(className, false, classLoader);
+        Constructor<?> constructor = clazz.getDeclaredConstructor(parameterTypes);
+        constructor.setAccessible(true);
+        return constructor;
+    }
+
+    private static Object[] toArgs(List<Object> args) {
+        return args.toArray(new Object[0]);
+    }
+
+    private static int intResult(Object result) {
+        return result instanceof Integer ? (Integer) result : 0;
     }
 
     private static volatile int readHookCount = 0;

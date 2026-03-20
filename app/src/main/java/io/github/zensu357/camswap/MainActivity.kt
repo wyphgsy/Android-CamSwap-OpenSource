@@ -65,7 +65,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Auto-start service if enabled
-        if (configManager.getBoolean("notification_control_enabled", false)) {
+        if (configManager.getBoolean(ConfigManager.KEY_NOTIFICATION_CONTROL_ENABLED, false)) {
             try {
                 val intent = Intent(this, NotificationService::class.java)
                 startForegroundService(intent)

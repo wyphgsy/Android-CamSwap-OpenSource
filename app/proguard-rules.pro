@@ -1,12 +1,12 @@
 # Add project specific ProGuard rules here.
 
-# Xposed Bridge
--keep class de.robv.android.xposed.** { *; }
--keepclassmembers class de.robv.android.xposed.** { *; }
+# LibXposed descriptors
+-adaptresourcefilecontents META-INF/xposed/java_init.list
+-adaptresourcefilecontents META-INF/xposed/scope.list
 
-# Keep Xposed Entry Point
--keep class io.github.zensu357.camswap.HookMain { *; }
--keepclassmembers class io.github.zensu357.camswap.HookMain { *; }
+# Keep LibXposed entry points
+-keep class io.github.zensu357.camswap.Api101ModuleMain { *; }
+-keep class io.github.libxposed.** { *; }
 
 # Keep Application Classes
 -keep class io.github.zensu357.camswap.** { *; }

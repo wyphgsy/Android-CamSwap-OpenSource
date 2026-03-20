@@ -1,6 +1,7 @@
 package io.github.zensu357.camswap;
 
 import android.media.MediaPlayer;
+import android.os.SystemClock;
 import android.view.Surface;
 
 import io.github.zensu357.camswap.utils.LogUtil;
@@ -15,6 +16,8 @@ import io.github.zensu357.camswap.utils.VideoManager;
 public final class MediaPlayerManager {
     private final Object mediaLock = new Object();
     private String currentPackageName;
+    private volatile long lastCamera2PlaybackStartRealtimeMs;
+    private volatile int lastCamera2PlaybackDurationMs;
 
     // ---- Camera1 players (created by Camera1Handler) ----
     MediaPlayer mplayer1;
@@ -116,13 +119,32 @@ public final class MediaPlayerManager {
             }
             try {
                 int position = player.getCurrentPosition();
-                if (position >= 0) {
+                if (position > 0) {
                     return position;
                 }
             } catch (Exception ignored) {
             }
         }
+        if (lastCamera2PlaybackStartRealtimeMs > 0) {
+            long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - lastCamera2PlaybackStartRealtimeMs);
+            if (lastCamera2PlaybackDurationMs > 0) {
+                return elapsedMs % lastCamera2PlaybackDurationMs;
+            }
+            return elapsedMs;
+        }
         return 0;
+    }
+
+    private void markCamera2PlaybackStarted(MediaPlayer player, String tag) {
+        if (tag == null || !tag.startsWith("c2_") || player == null) {
+            return;
+        }
+        lastCamera2PlaybackStartRealtimeMs = SystemClock.elapsedRealtime();
+        try {
+            lastCamera2PlaybackDurationMs = Math.max(0, player.getDuration());
+        } catch (Exception ignored) {
+            lastCamera2PlaybackDurationMs = 0;
+        }
     }
 
     // =====================================================================
@@ -280,6 +302,7 @@ public final class MediaPlayerManager {
             }
             player.setOnPreparedListener(mp -> player.start());
             player.start();
+            markCamera2PlaybackStarted(player, tag);
             LogUtil.log("【CS】" + tag + " 已启动播放");
         } catch (Exception e) {
             LogUtil.log("【CS】[" + tag + "] 初始化播放器异常: " + android.util.Log.getStackTraceString(e));

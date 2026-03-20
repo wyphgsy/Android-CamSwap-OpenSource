@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">CamSwap</string>
+    <string name="module_description">Android virtual camera module</string>
     <string name="click_to_go_to_repo">Go to GitHub Repo</string>
     <string name="description">Visit the online repo for updates, tutorials, and feedback.</string>
     <string name="Warning">Strictly prohibited for illegal use!! Users bear all responsibilities and consequences!!</string>

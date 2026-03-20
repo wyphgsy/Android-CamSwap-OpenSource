@@ -10,6 +10,7 @@ import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.view.Surface;
 
 import java.util.ArrayList;
@@ -25,24 +26,39 @@ import java.util.Set;
 import java.util.Map;
 import android.media.ImageWriter;
 import android.media.Image;
+import android.media.ImageReader;
+import android.media.ImageReader.OnImageAvailableListener;
 import android.media.MediaMetadataRetriever;
+import android.os.SystemClock;
 import android.graphics.Bitmap;
 import android.graphics.Rect;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 
 import io.github.zensu357.camswap.utils.LogUtil;
 import io.github.zensu357.camswap.utils.VideoManager;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedHelpers;
+import io.github.zensu357.camswap.api101.compat.XC_MethodHook;
+import io.github.zensu357.camswap.api101.compat.XposedHelpers;
 
 /**
  * Handles Camera2 session interception: replaces real camera surfaces with
  * a virtual surface, then starts video playback via {@link MediaPlayerManager}.
  */
 public final class Camera2SessionHook {
+    private static final int WHATSAPP_YUV_BRIDGE_MAX_IMAGES = 8;
+
+    /**
+     * YUV 帧缓存刷新间隔（毫秒）。
+     * GL 渲染器可用时使用较短间隔以保持画面流畅；
+     * 回退到 MediaMetadataRetriever 时自动使用较长间隔，避免阻塞泵线程。
+     */
+    private static final long YUV_CACHE_REFRESH_GL_MS = 66L;
+    private static final long YUV_CACHE_REFRESH_FALLBACK_MS = 200L;
+
     private final MediaPlayerManager playerManager;
+    private volatile String currentPackageName;
 
     // Camera2 surfaces
     Surface previewSurface;
@@ -56,6 +72,10 @@ public final class Camera2SessionHook {
     public final Map<Surface, ImageWriter> imageWriterMap = new ConcurrentHashMap<>();
     public final Map<Surface, Integer> surfaceFormatMap = new ConcurrentHashMap<>();
     public final Map<Surface, int[]> surfaceSizeMap = new ConcurrentHashMap<>();
+    private final Map<Surface, CachedYuvFrame> cachedYuvFrameMap = new ConcurrentHashMap<>();
+    private final Map<Surface, FakeYuvBridge> fakeYuvBridgeMap = new ConcurrentHashMap<>();
+    private final Set<Surface> internalFakeYuvReaderSurfaces = Collections
+            .newSetFromMap(new ConcurrentHashMap<Surface, Boolean>());
     public final Set<Surface> pendingJpegSurfaces = Collections
             .newSetFromMap(new ConcurrentHashMap<Surface, Boolean>());
     private final Set<String> hookedStateCallbackClasses = Collections
@@ -64,14 +84,37 @@ public final class Camera2SessionHook {
             .newSetFromMap(new ConcurrentHashMap<String, Boolean>());
     private final Set<String> hookedSessionCallbackClasses = Collections
             .newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private volatile long lastWhatsAppYuvSuccessLogMs = 0L;
+    private volatile long lastWhatsAppYuvPlaceholderLogMs = 0L;
+    private volatile long lastNoGlRendererLogMs = 0L;
+    private volatile long lastGlBlackFallbackLogMs = 0L;
+    private volatile long lastGlNullFallbackLogMs = 0L;
+    /** 上一次 YUV 帧是否通过回退路径（视频文件截帧）生成 */
+    private volatile boolean lastYuvFrameWasFallback = true;
+    private final Map<ImageReader, YuvCallbackPump> whatsappYuvPumpMap = new ConcurrentHashMap<>();
+    private HandlerThread whatsappYuvPumpThread;
+    private Handler whatsappYuvPumpHandler;
 
     // Photo Fake: 等待 build() 时触发
     public volatile Surface pendingPhotoSurface;
+    private volatile boolean bypassCurrentSession = false;
 
     // Virtual surface for session hijacking
     private Surface virtualSurface;
     private SurfaceTexture virtualTexture;
     private boolean needRecreate;
+    private final ThreadLocal<Integer> fakeYuvAcquireDepth = new ThreadLocal<Integer>() {
+        @Override
+        protected Integer initialValue() {
+            return 0;
+        }
+    };
+    private final ThreadLocal<Integer> internalBridgeCreationDepth = new ThreadLocal<Integer>() {
+        @Override
+        protected Integer initialValue() {
+            return 0;
+        }
+    };
 
     /** Public accessor for Camera2Handler to check/redirect surfaces. */
     public Surface getVirtualSurface() {
@@ -89,12 +132,28 @@ public final class Camera2SessionHook {
         this.playerManager = playerManager;
     }
 
+    public void setCurrentPackageName(String packageName) {
+        currentPackageName = packageName;
+        playerManager.setPackageName(packageName);
+    }
+
     private boolean isWhatsAppPackage(String packageName) {
         return packageName != null && packageName.toLowerCase(Locale.ROOT).contains("whatsapp");
     }
 
     private String getCurrentPackageName() {
+        if (currentPackageName != null && !currentPackageName.isEmpty()) {
+            return currentPackageName;
+        }
         return HookMain.toast_content != null ? HookMain.toast_content.getPackageName() : null;
+    }
+
+    public boolean isCurrentSessionBypassed() {
+        return bypassCurrentSession;
+    }
+
+    private void setBypassCurrentSession(boolean bypass) {
+        bypassCurrentSession = bypass;
     }
 
     /** Called by Camera2Handler when onOpened fires on the state callback class. */
@@ -111,11 +170,12 @@ public final class Camera2SessionHook {
                 needRecreate = true;
                 createVirtualSurface();
                 playerManager.releaseCamera2Resources();
-                releaseImageWriters();
+                releaseImageWriters(false);
                 previewSurface1 = null;
                 readerSurface1 = null;
                 readerSurface = null;
                 previewSurface = null;
+                setBypassCurrentSession(false);
                 isFirstHookBuild = true;
                 LogUtil.log("【CS】打开相机C2");
 
@@ -141,6 +201,7 @@ public final class Camera2SessionHook {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 LogUtil.log("【CS】相机关闭 onClosed，释放播放器资源");
+                setBypassCurrentSession(false);
                 playerManager.releaseCamera2Resources();
                 releaseImageWriters();
             }
@@ -157,6 +218,7 @@ public final class Camera2SessionHook {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 LogUtil.log("【CS】相机断开 onDisconnected，释放播放器资源");
+                setBypassCurrentSession(false);
                 playerManager.releaseCamera2Resources();
                 releaseImageWriters();
             }
@@ -195,17 +257,101 @@ public final class Camera2SessionHook {
         if (!isTrackedReaderSurface(surface)) {
             return false;
         }
-        if (isJpegReaderSurface(surface)) {
-            return true;
+        return isJpegReaderSurface(surface);
+    }
+
+    public boolean shouldKeepRealReaderSurfaceForCurrentPackage(Surface surface) {
+        return shouldKeepRealReaderSurfaceForPackage(surface, getCurrentPackageName());
+    }
+
+    private boolean shouldKeepYuvReaderSurfaceForPackage(Surface surface, String packageName) {
+        return isWhatsAppPackage(packageName)
+                && isYuvReaderSurface(surface)
+                && !isInternalFakeYuvReaderSurface(surface);
+    }
+
+    public boolean shouldKeepYuvReaderSurfaceForCurrentPackage(Surface surface) {
+        return shouldKeepYuvReaderSurfaceForPackage(surface, getCurrentPackageName());
+    }
+
+    public boolean shouldSkipImageReaderTracking() {
+        return internalBridgeCreationDepth.get() > 0;
+    }
+
+    public boolean shouldBypassYuvAcquireHook(Surface surface) {
+        return fakeYuvAcquireDepth.get() > 0 || isInternalFakeYuvReaderSurface(surface);
+    }
+
+    public boolean isInternalFakeYuvReaderSurface(Surface surface) {
+        return surface != null && internalFakeYuvReaderSurfaces.contains(surface);
+    }
+
+    private void enterInternalBridgeCreation() {
+        internalBridgeCreationDepth.set(internalBridgeCreationDepth.get() + 1);
+    }
+
+    private void exitInternalBridgeCreation() {
+        int depth = internalBridgeCreationDepth.get();
+        if (depth <= 1) {
+            internalBridgeCreationDepth.remove();
+        } else {
+            internalBridgeCreationDepth.set(depth - 1);
         }
-        if (packageName != null && packageName.toLowerCase(Locale.ROOT).contains("whatsapp")) {
-            return true;
+    }
+
+    private void enterFakeYuvAcquire() {
+        fakeYuvAcquireDepth.set(fakeYuvAcquireDepth.get() + 1);
+    }
+
+    private void exitFakeYuvAcquire() {
+        int depth = fakeYuvAcquireDepth.get();
+        if (depth <= 1) {
+            fakeYuvAcquireDepth.remove();
+        } else {
+            fakeYuvAcquireDepth.set(depth - 1);
         }
-        return false;
     }
 
     public boolean shouldUseReaderPlaybackSurfaceForPackage(String packageName) {
         return !isWhatsAppPackage(packageName);
+    }
+
+    public boolean isYuvReaderSurface(Surface surface) {
+        Integer format = surfaceFormatMap.get(surface);
+        return format != null && format == ImageFormat.YUV_420_888;
+    }
+
+    private Surface getOutputSurface(Object output) {
+        if (output instanceof Surface) {
+            return (Surface) output;
+        }
+        if (output instanceof OutputConfiguration) {
+            return ((OutputConfiguration) output).getSurface();
+        }
+        return null;
+    }
+
+    private boolean shouldBypassWhatsAppYuvSession(List<?> outputs, String packageName) {
+        // 不再需要整体旁路 session：YUV reader surface 现在直接保留在 session 输出中，
+        // preview surface 仍然替换为虚拟 surface。这样 Camera HAL 会为 YUV reader
+        // 产出正确格式的帧，同时 preview 仍然显示我们的替换视频。
+        return false;
+    }
+
+    private void enableSessionBypass(String reason) {
+        if (!bypassCurrentSession) {
+            LogUtil.log("【CS】启用 WhatsApp YUV 会话旁路: " + reason);
+        }
+        setBypassCurrentSession(true);
+        previewSurface = null;
+        previewSurface1 = null;
+        readerSurface = null;
+        readerSurface1 = null;
+        playerManager.releaseCamera2Resources();
+    }
+
+    private void disableSessionBypass() {
+        setBypassCurrentSession(false);
     }
 
     public void rememberPreviewSurface(Surface surface) {
@@ -309,7 +455,13 @@ public final class Camera2SessionHook {
         if (outputs != null) {
             for (Object output : outputs) {
                 if (output instanceof Surface) {
-                    rewritten.add(getSessionSurface((Surface) output, packageName));
+                    Surface surface = (Surface) output;
+                    if (shouldKeepYuvReaderSurfaceForPackage(surface, packageName)) {
+                        rewritten.add(surface);
+                        LogUtil.log("【CS】Session 保留 WhatsApp YUV reader surface: " + surface);
+                    } else {
+                        rewritten.add(getSessionSurface(surface, packageName));
+                    }
                 }
             }
         }
@@ -343,8 +495,12 @@ public final class Camera2SessionHook {
                 }
                 OutputConfiguration config = (OutputConfiguration) output;
                 Surface originalSurface = config.getSurface();
-                if (shouldKeepRealReaderSurfaceForPackage(originalSurface, packageName)) {
+                if (shouldKeepRealReaderSurfaceForPackage(originalSurface, packageName)
+                        || shouldKeepYuvReaderSurfaceForPackage(originalSurface, packageName)) {
                     rewritten.add(createOutputConfiguration(config, originalSurface));
+                    if (shouldKeepYuvReaderSurfaceForPackage(originalSurface, packageName)) {
+                        LogUtil.log("【CS】OutputConfig 保留 WhatsApp YUV reader surface: " + originalSurface);
+                    }
                 } else if (!hasVirtualOutput) {
                     rewritten.add(createOutputConfiguration(config, createVirtualSurface()));
                     hasVirtualOutput = true;
@@ -359,7 +515,8 @@ public final class Camera2SessionHook {
 
     private SessionConfiguration rewriteSessionConfiguration(SessionConfiguration sessionConfiguration) {
         String packageName = getCurrentPackageName();
-        List<OutputConfiguration> outputs = rewriteOutputConfigurations(sessionConfiguration.getOutputConfigurations(), packageName);
+        List<OutputConfiguration> outputs = rewriteOutputConfigurations(sessionConfiguration.getOutputConfigurations(),
+                packageName);
         SessionConfiguration rewritten = new SessionConfiguration(
                 sessionConfiguration.getSessionType(),
                 outputs,
@@ -396,15 +553,22 @@ public final class Camera2SessionHook {
         // 1. createCaptureSession(List, StateCallback, Handler)
         XposedHelpers.findAndHookMethod(deviceClass, "createCaptureSession", List.class,
                 CameraCaptureSession.StateCallback.class, Handler.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam p) {
-                            if (p.args[0] != null) {
-                                LogUtil.log("【CS】createCaptureSession创建捕获，原始:" + p.args[0] + "虚拟：" + virtualSurface);
-                                p.args[0] = rewriteSessionSurfaces((List<?>) p.args[0]);
-                                if (p.args[1] != null)
-                                    hookSessionCallback((CameraCaptureSession.StateCallback) p.args[1]);
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        if (p.args[0] != null) {
+                            if (shouldBypassWhatsAppYuvSession((List<?>) p.args[0], getCurrentPackageName())) {
+                                enableSessionBypass("createCaptureSession(List)");
+                            } else {
+                                disableSessionBypass();
                             }
+                            LogUtil.log("【CS】createCaptureSession创建捕获，原始:" + p.args[0] + "虚拟：" + virtualSurface);
+                            if (!isCurrentSessionBypassed()) {
+                                p.args[0] = rewriteSessionSurfaces((List<?>) p.args[0]);
+                            }
+                            if (p.args[1] != null)
+                                hookSessionCallback((CameraCaptureSession.StateCallback) p.args[1]);
                         }
+                    }
                 });
 
         // 2. createCaptureSessionByOutputConfigurations (API 24+)
@@ -415,7 +579,14 @@ public final class Camera2SessionHook {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam p) {
                             if (p.args[0] != null) {
-                                p.args[0] = rewriteOutputConfigurations((List<?>) p.args[0]);
+                                if (shouldBypassWhatsAppYuvSession((List<?>) p.args[0], getCurrentPackageName())) {
+                                    enableSessionBypass("createCaptureSessionByOutputConfigurations");
+                                } else {
+                                    disableSessionBypass();
+                                }
+                                if (!isCurrentSessionBypassed()) {
+                                    p.args[0] = rewriteOutputConfigurations((List<?>) p.args[0]);
+                                }
                                 LogUtil.log("【CS】执行了createCaptureSessionByOutputConfigurations");
                                 if (p.args[1] != null)
                                     hookSessionCallback((CameraCaptureSession.StateCallback) p.args[1]);
@@ -430,7 +601,14 @@ public final class Camera2SessionHook {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam p) {
                         if (p.args[0] != null) {
-                            p.args[0] = rewriteSessionSurfaces((List<?>) p.args[0]);
+                            if (shouldBypassWhatsAppYuvSession((List<?>) p.args[0], getCurrentPackageName())) {
+                                enableSessionBypass("createConstrainedHighSpeedCaptureSession");
+                            } else {
+                                disableSessionBypass();
+                            }
+                            if (!isCurrentSessionBypassed()) {
+                                p.args[0] = rewriteSessionSurfaces((List<?>) p.args[0]);
+                            }
                             LogUtil.log("【CS】执行了 createConstrainedHighSpeedCaptureSession");
                             if (p.args[1] != null)
                                 hookSessionCallback((CameraCaptureSession.StateCallback) p.args[1]);
@@ -446,7 +624,14 @@ public final class Camera2SessionHook {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam p) {
                             if (p.args[1] != null) {
-                                p.args[1] = rewriteSessionSurfaces((List<?>) p.args[1]);
+                                if (shouldBypassWhatsAppYuvSession((List<?>) p.args[1], getCurrentPackageName())) {
+                                    enableSessionBypass("createReprocessableCaptureSession");
+                                } else {
+                                    disableSessionBypass();
+                                }
+                                if (!isCurrentSessionBypassed()) {
+                                    p.args[1] = rewriteSessionSurfaces((List<?>) p.args[1]);
+                                }
                                 LogUtil.log("【CS】执行了 createReprocessableCaptureSession ");
                                 if (p.args[2] != null)
                                     hookSessionCallback((CameraCaptureSession.StateCallback) p.args[2]);
@@ -463,7 +648,14 @@ public final class Camera2SessionHook {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam p) {
                             if (p.args[1] != null) {
-                                p.args[1] = rewriteOutputConfigurations((List<?>) p.args[1]);
+                                if (shouldBypassWhatsAppYuvSession((List<?>) p.args[1], getCurrentPackageName())) {
+                                    enableSessionBypass("createReprocessableCaptureSessionByConfigurations");
+                                } else {
+                                    disableSessionBypass();
+                                }
+                                if (!isCurrentSessionBypassed()) {
+                                    p.args[1] = rewriteOutputConfigurations((List<?>) p.args[1]);
+                                }
                                 LogUtil.log("【CS】执行了 createReprocessableCaptureSessionByConfigurations");
                                 if (p.args[2] != null)
                                     hookSessionCallback((CameraCaptureSession.StateCallback) p.args[2]);
@@ -481,8 +673,16 @@ public final class Camera2SessionHook {
                             if (p.args[0] != null) {
                                 LogUtil.log("【CS】执行了 createCaptureSession (SessionConfiguration)");
                                 realSessionConfig = (SessionConfiguration) p.args[0];
-                                fakeSessionConfig = rewriteSessionConfiguration(realSessionConfig);
-                                p.args[0] = fakeSessionConfig;
+                                if (shouldBypassWhatsAppYuvSession(realSessionConfig.getOutputConfigurations(),
+                                        getCurrentPackageName())) {
+                                    enableSessionBypass("createCaptureSession(SessionConfiguration)");
+                                } else {
+                                    disableSessionBypass();
+                                }
+                                if (!isCurrentSessionBypassed()) {
+                                    fakeSessionConfig = rewriteSessionConfiguration(realSessionConfig);
+                                    p.args[0] = fakeSessionConfig;
+                                }
                                 hookSessionCallback(realSessionConfig.getStateCallback());
                             }
                         }
@@ -514,16 +714,27 @@ public final class Camera2SessionHook {
                         LogUtil.log("【CS】onConfigured ：" + p.args[0]);
                     }
                 });
-        XposedHelpers.findAndHookMethod(cb.getClass(), "onClosed", CameraCaptureSession.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam p) {
-                        LogUtil.log("【CS】onClosed ：" + p.args[0]);
-                    }
-                });
+        try {
+            XposedHelpers.findAndHookMethod(cb.getClass(), "onClosed", CameraCaptureSession.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam p) {
+                            LogUtil.log("【CS】onClosed ：" + p.args[0]);
+                        }
+                    });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook session onClosed 失败: " + t);
+        }
     }
 
     public void releaseImageWriters() {
+        releaseImageWriters(true);
+    }
+
+    private void releaseImageWriters(boolean clearTrackedReaders) {
+        if (clearTrackedReaders) {
+            stopAllWhatsAppYuvPumps();
+        }
         for (ImageWriter writer : imageWriterMap.values()) {
             try {
                 writer.close();
@@ -532,11 +743,563 @@ public final class Camera2SessionHook {
             }
         }
         imageWriterMap.clear();
-        trackedReaderSurfaces.clear();
-        surfaceFormatMap.clear();
-        surfaceSizeMap.clear();
         pendingJpegSurfaces.clear();
         pendingPhotoSurface = null;
+        bypassCurrentSession = false;
+        if (clearTrackedReaders) {
+            closeFakeYuvBridges();
+            internalFakeYuvReaderSurfaces.clear();
+            trackedReaderSurfaces.clear();
+            surfaceFormatMap.clear();
+            surfaceSizeMap.clear();
+            cachedYuvFrameMap.clear();
+            releaseCachedRetriever();
+            lastYuvFrameWasFallback = true;
+        }
+    }
+
+    public void updateImageReaderListener(Object imageReaderObj, Object listenerObj, Handler handler) {
+        if (!(imageReaderObj instanceof ImageReader)) {
+            return;
+        }
+        ImageReader imageReader = (ImageReader) imageReaderObj;
+        Surface surface = imageReader.getSurface();
+        if (!shouldKeepYuvReaderSurfaceForCurrentPackage(surface)) {
+            return;
+        }
+        if (listenerObj == null) {
+            stopWhatsAppYuvPump(imageReader);
+            return;
+        }
+        ensureWhatsAppYuvPumpHandler();
+        YuvCallbackPump pump = whatsappYuvPumpMap.get(imageReader);
+        if (pump == null) {
+            pump = new YuvCallbackPump(imageReader);
+            whatsappYuvPumpMap.put(imageReader, pump);
+        }
+        pump.listener = listenerObj;
+        pump.onImageAvailableMethod = null;
+        pump.targetHandler = handler;
+        if (pump.running) {
+            return;
+        }
+        pump.running = true;
+        whatsappYuvPumpHandler.post(pump.notifyRunnable);
+        LogUtil.log("【CS】WhatsApp YUV 回调泵已启动: " + surface);
+    }
+
+    private void ensureWhatsAppYuvPumpHandler() {
+        if (whatsappYuvPumpThread != null && whatsappYuvPumpHandler != null) {
+            return;
+        }
+        whatsappYuvPumpThread = new HandlerThread("CS-WhatsAppYuvPump");
+        whatsappYuvPumpThread.start();
+        whatsappYuvPumpHandler = new Handler(whatsappYuvPumpThread.getLooper());
+    }
+
+    private void stopWhatsAppYuvPump(ImageReader imageReader) {
+        if (imageReader == null) {
+            return;
+        }
+        YuvCallbackPump pump = whatsappYuvPumpMap.remove(imageReader);
+        if (pump == null) {
+            return;
+        }
+        pump.running = false;
+        if (whatsappYuvPumpHandler != null) {
+            whatsappYuvPumpHandler.removeCallbacks(pump.notifyRunnable);
+        }
+    }
+
+    private void stopAllWhatsAppYuvPumps() {
+        if (whatsappYuvPumpHandler != null) {
+            for (YuvCallbackPump pump : whatsappYuvPumpMap.values()) {
+                pump.running = false;
+                whatsappYuvPumpHandler.removeCallbacks(pump.notifyRunnable);
+            }
+        }
+        whatsappYuvPumpMap.clear();
+        if (whatsappYuvPumpThread != null) {
+            try {
+                whatsappYuvPumpThread.quitSafely();
+            } catch (Throwable ignored) {
+            }
+            whatsappYuvPumpThread = null;
+            whatsappYuvPumpHandler = null;
+        }
+    }
+
+    private void dispatchWhatsAppYuvCallback(YuvCallbackPump pump) {
+        if (pump == null || !pump.running || pump.listener == null) {
+            return;
+        }
+        Runnable callback = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (pump.listener instanceof OnImageAvailableListener) {
+                        ((OnImageAvailableListener) pump.listener).onImageAvailable(pump.imageReader);
+                    } else {
+                        pump.resolveOnImageAvailableMethod().invoke(pump.listener, pump.imageReader);
+                    }
+                } catch (Throwable t) {
+                    pump.running = false;
+                    LogUtil.log("【CS】WhatsApp YUV 回调分发失败: " + t);
+                }
+            }
+        };
+        if (pump.targetHandler != null) {
+            pump.targetHandler.post(callback);
+        } else {
+            callback.run();
+        }
+    }
+
+    public Image acquireFakeWhatsAppYuvImage(Object imageReader, Surface targetSurface) {
+        if (targetSurface == null || !shouldKeepYuvReaderSurfaceForCurrentPackage(targetSurface)) {
+            return null;
+        }
+        int width = 0;
+        int height = 0;
+        if (imageReader != null) {
+            try {
+                ImageReader typedReader = (ImageReader) imageReader;
+                width = typedReader.getWidth();
+                height = typedReader.getHeight();
+            } catch (Throwable ignored) {
+            }
+        }
+        if (width <= 0 || height <= 0) {
+            int[] size = surfaceSizeMap.get(targetSurface);
+            if (size != null && size.length >= 2) {
+                width = size[0];
+                height = size[1];
+            }
+        }
+        if (width <= 0 || height <= 0) {
+            return null;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        CachedYuvFrame cached = cachedYuvFrameMap.get(targetSurface);
+        if (cached == null || cached.width != width || cached.height != height) {
+            cached = buildPlaceholderYuvFrame(width, height, now);
+            cachedYuvFrameMap.put(targetSurface, cached);
+        }
+        // 根据上一帧是否走了回退路径来决定刷新间隔：
+        // - GL 截帧成功时用短间隔（66ms）保持流畅
+        // - 回退到 MediaMetadataRetriever 时用长间隔（1s），因为该操作非常慢（~700ms/帧），
+        // 频繁调用会阻塞泵线程导致帧率极低
+        long refreshInterval = lastYuvFrameWasFallback
+                ? YUV_CACHE_REFRESH_FALLBACK_MS
+                : YUV_CACHE_REFRESH_GL_MS;
+        if (now - cached.generatedAtMs >= refreshInterval) {
+            CachedYuvFrame refreshed = buildCachedYuvFrame(targetSurface, width, height, now);
+            if (refreshed != null) {
+                cached = refreshed;
+                cachedYuvFrameMap.put(targetSurface, cached);
+            }
+        }
+        try {
+            FakeYuvBridge bridge = getOrCreateFakeYuvBridge(targetSurface, width, height);
+            if (bridge == null) {
+                return null;
+            }
+            enterFakeYuvAcquire();
+            try {
+                clearPendingFakeYuvBridgeImages(bridge);
+                Image inputImage = bridge.writer.dequeueInputImage();
+                if (inputImage == null) {
+                    return null;
+                }
+                boolean queued = false;
+                try {
+                    copyCachedYuvFrameToImage(cached, inputImage);
+                    inputImage.setCropRect(new Rect(0, 0, width, height));
+                    inputImage.setTimestamp(System.nanoTime());
+                    bridge.writer.queueInputImage(inputImage);
+                    queued = true;
+                } finally {
+                    if (!queued) {
+                        inputImage.close();
+                    }
+                }
+                // 使用 acquireNextImage 而非 acquireLatestImage：
+                // acquireLatestImage 会自动 close 所有之前已 acquire 但未被消费方 close 的 Image，
+                // WhatsApp VoipCameraManager.getLastCachedFrame() 会缓存旧 Image 引用，
+                // 如果我们通过 acquireLatestImage 隐式关闭了它，WhatsApp 在后续调用
+                // image.getPlanes() 时就会抛出 IllegalStateException: Image is already closed
+                Image image = bridge.reader.acquireNextImage();
+                if (image != null) {
+                    if (cached.isPlaceholder) {
+                        maybeLogWhatsAppYuvPlaceholder(width, height);
+                    }
+                    maybeLogWhatsAppYuvSuccess(width, height, image.getTimestamp());
+                }
+                return image;
+            } finally {
+                exitFakeYuvAcquire();
+            }
+        } catch (Exception e) {
+            LogUtil.log("【CS】WhatsApp YUV 伪帧获取失败: " + e);
+            return null;
+        }
+    }
+
+    private void clearPendingFakeYuvBridgeImages(FakeYuvBridge bridge) {
+        if (bridge == null) {
+            return;
+        }
+        while (true) {
+            Image pendingImage = null;
+            try {
+                pendingImage = bridge.reader.acquireNextImage();
+            } catch (IllegalStateException e) {
+                break;
+            } catch (Exception e) {
+                LogUtil.log("【CS】清理 WhatsApp YUV 桥旧帧失败: " + e);
+                break;
+            }
+            if (pendingImage == null) {
+                break;
+            }
+            try {
+                pendingImage.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private CachedYuvFrame buildCachedYuvFrame(Surface targetSurface, int width, int height, long nowMs) {
+        Bitmap frame = captureFrameForStill(width, height);
+        if (frame == null) {
+            return null;
+        }
+        try {
+            if (frame.getWidth() != width || frame.getHeight() != height) {
+                Bitmap scaled = fitBitmapToTargetAspect(frame, width, height);
+                if (scaled != frame) {
+                    frame.recycle();
+                    frame = scaled;
+                }
+            }
+            int[] pixels = new int[width * height];
+            frame.getPixels(pixels, 0, width, 0, 0, width, height);
+
+            byte[] yPlane = new byte[width * height];
+            byte[] uPlane = new byte[(width / 2) * (height / 2)];
+            byte[] vPlane = new byte[(width / 2) * (height / 2)];
+
+            for (int y = 0; y < height; y++) {
+                int pixelRowOffset = y * width;
+                int yRowOffset = y * width;
+                for (int x = 0; x < width; x++) {
+                    int pixel = pixels[pixelRowOffset + x];
+                    int r = (pixel >> 16) & 0xff;
+                    int g = (pixel >> 8) & 0xff;
+                    int b = pixel & 0xff;
+                    yPlane[yRowOffset + x] = (byte) clampToByte(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+                }
+            }
+
+            int chromaWidth = width / 2;
+            for (int y = 0; y < height; y += 2) {
+                for (int x = 0; x < width; x += 2) {
+                    int[] uv = computeAverageUv(pixels, width, height, x, y);
+                    int index = (y / 2) * chromaWidth + (x / 2);
+                    uPlane[index] = (byte) uv[0];
+                    vPlane[index] = (byte) uv[1];
+                }
+            }
+
+            return new CachedYuvFrame(width, height, yPlane, uPlane, vPlane, nowMs, System.nanoTime(), false);
+        } finally {
+            frame.recycle();
+        }
+    }
+
+    private CachedYuvFrame buildPlaceholderYuvFrame(int width, int height, long nowMs) {
+        byte[] yPlane = new byte[width * height];
+        byte[] uPlane = new byte[(width / 2) * (height / 2)];
+        byte[] vPlane = new byte[(width / 2) * (height / 2)];
+        Arrays.fill(yPlane, (byte) 16);
+        Arrays.fill(uPlane, (byte) 128);
+        Arrays.fill(vPlane, (byte) 128);
+        return new CachedYuvFrame(width, height, yPlane, uPlane, vPlane, nowMs, System.nanoTime(), true);
+    }
+
+    private void copyCachedYuvFrameToImage(CachedYuvFrame cached, Image image) {
+        if (image == null || image.getPlanes() == null || image.getPlanes().length < 3) {
+            throw new IllegalStateException("YUV Image plane 不可用");
+        }
+        Image.Plane[] planes = image.getPlanes();
+        ByteBuffer yBuffer = planes[0].getBuffer();
+        ByteBuffer uBuffer = planes[1].getBuffer();
+        ByteBuffer vBuffer = planes[2].getBuffer();
+        if (yBuffer == null || uBuffer == null || vBuffer == null
+                || yBuffer.isReadOnly() || uBuffer.isReadOnly() || vBuffer.isReadOnly()) {
+            throw new IllegalStateException("YUV Image plane Buffer 不可写");
+        }
+
+        int width = image.getWidth();
+        int height = image.getHeight();
+        if (width <= 0 || height <= 0 || width != cached.width || height != cached.height) {
+            throw new IllegalStateException("YUV Image 尺寸不匹配");
+        }
+
+        yBuffer.clear();
+        uBuffer.clear();
+        vBuffer.clear();
+
+        int yRowStride = planes[0].getRowStride();
+        int yPixelStride = planes[0].getPixelStride();
+        int uRowStride = planes[1].getRowStride();
+        int uPixelStride = planes[1].getPixelStride();
+        int vRowStride = planes[2].getRowStride();
+        int vPixelStride = planes[2].getPixelStride();
+
+        for (int y = 0; y < height; y++) {
+            int yRowOffset = y * yRowStride;
+            int sourceRowOffset = y * width;
+            for (int x = 0; x < width; x++) {
+                yBuffer.put(yRowOffset + x * yPixelStride, cached.yPlane[sourceRowOffset + x]);
+            }
+        }
+
+        int chromaWidth = width / 2;
+        int chromaHeight = height / 2;
+        for (int y = 0; y < chromaHeight; y++) {
+            int uRowOffset = y * uRowStride;
+            int vRowOffset = y * vRowStride;
+            int sourceRowOffset = y * chromaWidth;
+            for (int x = 0; x < chromaWidth; x++) {
+                uBuffer.put(uRowOffset + x * uPixelStride, cached.uPlane[sourceRowOffset + x]);
+                vBuffer.put(vRowOffset + x * vPixelStride, cached.vPlane[sourceRowOffset + x]);
+            }
+        }
+    }
+
+    private FakeYuvBridge getOrCreateFakeYuvBridge(Surface targetSurface, int width, int height) {
+        FakeYuvBridge bridge = fakeYuvBridgeMap.get(targetSurface);
+        if (bridge != null && bridge.width == width && bridge.height == height) {
+            return bridge;
+        }
+        if (bridge != null) {
+            closeFakeYuvBridge(bridge);
+        }
+        try {
+            enterInternalBridgeCreation();
+            ImageReader reader = null;
+            try {
+                // maxImages 设为 8：需要足够大以容纳 WhatsApp 缓存的旧帧 + 当前帧 + writer 队列
+                // 如果太小，WhatsApp 持有旧 Image 引用时新帧就无法被 acquire
+                reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888,
+                        WHATSAPP_YUV_BRIDGE_MAX_IMAGES);
+            } finally {
+                exitInternalBridgeCreation();
+            }
+            ImageWriter writer = ImageWriter.newInstance(reader.getSurface(), WHATSAPP_YUV_BRIDGE_MAX_IMAGES);
+            internalFakeYuvReaderSurfaces.add(reader.getSurface());
+            bridge = new FakeYuvBridge(reader, writer, width, height);
+            fakeYuvBridgeMap.put(targetSurface, bridge);
+            return bridge;
+        } catch (Exception e) {
+            LogUtil.log("【CS】创建 WhatsApp YUV 桥失败: " + e);
+            return null;
+        }
+    }
+
+    private void closeFakeYuvBridges() {
+        for (FakeYuvBridge bridge : fakeYuvBridgeMap.values()) {
+            closeFakeYuvBridge(bridge);
+        }
+        fakeYuvBridgeMap.clear();
+    }
+
+    private void closeFakeYuvBridge(FakeYuvBridge bridge) {
+        if (bridge == null) {
+            return;
+        }
+        try {
+            internalFakeYuvReaderSurfaces.remove(bridge.reader.getSurface());
+        } catch (Exception ignored) {
+        }
+        // 延迟关闭 bridge 的 reader/writer：
+        // WhatsApp 可能仍持有之前通过 acquireNextImage() 获取的 Image 引用，
+        // 如果立刻 close reader，这些 Image 会变为 invalid，WhatsApp 调用
+        // getPlanes() 时就会抛出 IllegalStateException: Image is already closed。
+        // 延迟 500ms 让 WhatsApp 有时间消费并 close 旧 Image。
+        final ImageWriter w = bridge.writer;
+        final ImageReader r = bridge.reader;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(500L);
+                } catch (InterruptedException ignored) {
+                }
+                try {
+                    w.close();
+                } catch (Exception ignored) {
+                }
+                try {
+                    r.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }, "CS-BridgeClose").start();
+    }
+
+    private int[] computeAverageUv(int[] pixels, int width, int height, int startX, int startY) {
+        int sampleCount = 0;
+        int totalU = 0;
+        int totalV = 0;
+        for (int dy = 0; dy < 2; dy++) {
+            int y = startY + dy;
+            if (y >= height) {
+                continue;
+            }
+            for (int dx = 0; dx < 2; dx++) {
+                int x = startX + dx;
+                if (x >= width) {
+                    continue;
+                }
+                int pixel = pixels[y * width + x];
+                int r = (pixel >> 16) & 0xff;
+                int g = (pixel >> 8) & 0xff;
+                int b = pixel & 0xff;
+                totalU += clampToByte(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+                totalV += clampToByte(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+                sampleCount++;
+            }
+        }
+        if (sampleCount == 0) {
+            return new int[] { 128, 128 };
+        }
+        return new int[] { totalU / sampleCount, totalV / sampleCount };
+    }
+
+    private int clampToByte(int value) {
+        return Math.max(0, Math.min(255, value));
+    }
+
+    private void maybeLogWhatsAppYuvSuccess(int width, int height, long timestampNs) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastWhatsAppYuvSuccessLogMs < 1000L) {
+            return;
+        }
+        lastWhatsAppYuvSuccessLogMs = now;
+        LogUtil.log("【CS】WhatsApp YUV 伪帧已生成: " + width + "x" + height + " ts=" + timestampNs);
+    }
+
+    private void maybeLogWhatsAppYuvPlaceholder(int width, int height) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastWhatsAppYuvPlaceholderLogMs < 1000L) {
+            return;
+        }
+        lastWhatsAppYuvPlaceholderLogMs = now;
+        LogUtil.log("【CS】WhatsApp YUV 使用占位帧启动: " + width + "x" + height);
+    }
+
+    private void maybeLogNoGlRendererFallback() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastNoGlRendererLogMs < 1000L) {
+            return;
+        }
+        lastNoGlRendererLogMs = now;
+        LogUtil.log("【CS】无可用 GL 渲染器，回退到视频文件截帧");
+    }
+
+    private void maybeLogGlNullFallback() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastGlNullFallbackLogMs < 1000L) {
+            return;
+        }
+        lastGlNullFallbackLogMs = now;
+        LogUtil.log("【CS】GL 截帧返回 null，回退到视频文件截帧");
+    }
+
+    private void maybeLogGlBlackFallback() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastGlBlackFallbackLogMs < 1000L) {
+            return;
+        }
+        lastGlBlackFallbackLogMs = now;
+        LogUtil.log("【CS】GL 截帧过黑，回退到视频文件截帧");
+    }
+
+    private static final class CachedYuvFrame {
+        final int width;
+        final int height;
+        final byte[] yPlane;
+        final byte[] uPlane;
+        final byte[] vPlane;
+        final long generatedAtMs;
+        final long timestampNs;
+        final boolean isPlaceholder;
+
+        CachedYuvFrame(int width, int height, byte[] yPlane, byte[] uPlane, byte[] vPlane,
+                long generatedAtMs, long timestampNs, boolean isPlaceholder) {
+            this.width = width;
+            this.height = height;
+            this.yPlane = yPlane;
+            this.uPlane = uPlane;
+            this.vPlane = vPlane;
+            this.generatedAtMs = generatedAtMs;
+            this.timestampNs = timestampNs;
+            this.isPlaceholder = isPlaceholder;
+        }
+    }
+
+    private static final class FakeYuvBridge {
+        final ImageReader reader;
+        final ImageWriter writer;
+        final int width;
+        final int height;
+
+        FakeYuvBridge(ImageReader reader, ImageWriter writer, int width, int height) {
+            this.reader = reader;
+            this.writer = writer;
+            this.width = width;
+            this.height = height;
+        }
+    }
+
+    private final class YuvCallbackPump {
+        final ImageReader imageReader;
+        volatile Object listener;
+        volatile Handler targetHandler;
+        volatile boolean running;
+        volatile Method onImageAvailableMethod;
+        final Runnable notifyRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!running || whatsappYuvPumpHandler == null) {
+                    return;
+                }
+                dispatchWhatsAppYuvCallback(YuvCallbackPump.this);
+                whatsappYuvPumpHandler.postDelayed(this, 66L);
+            }
+        };
+
+        YuvCallbackPump(ImageReader imageReader) {
+            this.imageReader = imageReader;
+        }
+
+        Method resolveOnImageAvailableMethod() throws NoSuchMethodException {
+            Method method = onImageAvailableMethod;
+            if (method != null) {
+                return method;
+            }
+            Object currentListener = listener;
+            if (currentListener == null) {
+                throw new NoSuchMethodException("Listener missing");
+            }
+            method = currentListener.getClass().getMethod("onImageAvailable", ImageReader.class);
+            method.setAccessible(true);
+            onImageAvailableMethod = method;
+            return method;
+        }
     }
 
     /** 获取当前活跃的 GLVideoRenderer（优先 preview，其次 reader） */
@@ -589,41 +1352,65 @@ public final class Camera2SessionHook {
             if (frame != null) {
                 frame = fitBitmapToTargetAspect(frame, targetWidth, targetHeight);
                 if (!isBitmapMostlyBlack(frame)) {
+                    lastYuvFrameWasFallback = false;
                     return frame;
                 }
-                LogUtil.log("【CS】GL 截帧过黑，回退到视频文件截帧");
+                maybeLogGlBlackFallback();
                 frame.recycle();
             } else {
-                LogUtil.log("【CS】GL 截帧返回 null，回退到视频文件截帧");
+                maybeLogGlNullFallback();
             }
         } else {
-            LogUtil.log("【CS】无可用 GL 渲染器，回退到视频文件截帧");
+            maybeLogNoGlRendererFallback();
         }
+
+        lastYuvFrameWasFallback = true;
 
         return captureFrameFromVideoFile(targetWidth, targetHeight);
     }
 
+    /** 缓存的 MediaMetadataRetriever 实例，避免每帧都重新创建和 setDataSource */
+    private MediaMetadataRetriever cachedRetriever;
+    private String cachedRetrieverPath;
+
     private Bitmap captureFrameFromVideoFile(int targetWidth, int targetHeight) {
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
         try {
-            android.os.ParcelFileDescriptor pfd = VideoManager.getVideoPFD();
-            if (pfd != null) {
-                try {
-                    retriever.setDataSource(pfd.getFileDescriptor());
-                } finally {
+            String currentPath = VideoManager.getCurrentVideoPath();
+            // 复用已有 retriever，只在路径变化时重新创建
+            if (cachedRetriever == null || cachedRetrieverPath == null
+                    || !cachedRetrieverPath.equals(currentPath)) {
+                releaseCachedRetriever();
+                MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+                android.os.ParcelFileDescriptor pfd = VideoManager.getVideoPFD();
+                if (pfd != null) {
                     try {
-                        pfd.close();
-                    } catch (Exception ignored) {
+                        retriever.setDataSource(pfd.getFileDescriptor());
+                    } finally {
+                        try {
+                            pfd.close();
+                        } catch (Exception ignored) {
+                        }
                     }
+                } else {
+                    retriever.setDataSource(currentPath);
                 }
-            } else {
-                retriever.setDataSource(VideoManager.getCurrentVideoPath());
+                cachedRetriever = retriever;
+                cachedRetrieverPath = currentPath;
             }
 
             long positionUs = HookMain.playerManager.getCamera2PlaybackPositionMs() * 1000L;
-            Bitmap frame = retriever.getFrameAtTime(positionUs, MediaMetadataRetriever.OPTION_CLOSEST);
+            if (positionUs <= 0) {
+                positionUs = 33_000L;
+            }
+            // 使用 OPTION_CLOSEST_SYNC 而非 OPTION_CLOSEST：
+            // OPTION_CLOSEST 需要精确 seek 到指定时间戳并解码到该帧，非常慢（~500-800ms）；
+            // OPTION_CLOSEST_SYNC 只 seek 到最近的关键帧，通常 <100ms，
+            // 对于预览目的足够用，牺牲精度换取帧率。
+            Bitmap frame = cachedRetriever.getFrameAtTime(positionUs,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
             if (frame == null && positionUs > 0) {
-                frame = retriever.getFrameAtTime(-1, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                frame = cachedRetriever.getFrameAtTime(-1,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
             }
             if (frame == null) {
                 return null;
@@ -631,12 +1418,20 @@ public final class Camera2SessionHook {
             return fitBitmapToTargetAspect(frame, targetWidth, targetHeight);
         } catch (Exception e) {
             LogUtil.log("【CS】视频文件截帧失败: " + e);
+            // 出错时释放缓存的 retriever，下次重试
+            releaseCachedRetriever();
             return null;
-        } finally {
+        }
+    }
+
+    private void releaseCachedRetriever() {
+        if (cachedRetriever != null) {
             try {
-                retriever.release();
+                cachedRetriever.release();
             } catch (Exception ignored) {
             }
+            cachedRetriever = null;
+            cachedRetrieverPath = null;
         }
     }
 
@@ -671,7 +1466,8 @@ public final class Camera2SessionHook {
         }
 
         Bitmap cropped = source;
-        if (cropRect.left != 0 || cropRect.top != 0 || cropRect.width() != sourceWidth || cropRect.height() != sourceHeight) {
+        if (cropRect.left != 0 || cropRect.top != 0 || cropRect.width() != sourceWidth
+                || cropRect.height() != sourceHeight) {
             cropped = Bitmap.createBitmap(source, cropRect.left, cropRect.top, cropRect.width(), cropRect.height());
             source.recycle();
         }
@@ -749,7 +1545,7 @@ public final class Camera2SessionHook {
             return false;
         }
         try {
-            Surface surface = (Surface) XposedHelpers.callMethod(imageReader, "getSurface");
+            Surface surface = ((ImageReader) imageReader).getSurface();
             if (!shouldKeepRealReaderSurface(surface) || !pendingJpegSurfaces.contains(surface)) {
                 return false;
             }

@@ -282,3 +282,5 @@ app/src/test/java/com/example/camswap/ConfigManagerTest.java
 app/src/test/java/com/example/camswap/VideoProviderTest.java
 app/src/test/java/com/example/camswap/ConfigManagerTest.java
 app/src/test/java/com/example/camswap/VideoProviderTest.java
+API101_MIGRATION_PLAN.md
+REFACTOR_PLAN.md

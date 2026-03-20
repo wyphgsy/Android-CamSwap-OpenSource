@@ -9,23 +9,25 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
 import android.media.Image;
+import android.media.ImageReader;
 import android.os.Build;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 
 import java.util.Arrays;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.List;
 import java.util.Set;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import io.github.libxposed.api.XposedInterface;
+import io.github.zensu357.camswap.api101.Api101Runtime;
 
 import io.github.zensu357.camswap.utils.PermissionHelper;
 import io.github.zensu357.camswap.utils.VideoManager;
 import io.github.zensu357.camswap.utils.LogUtil;
 
-public class HookMain implements IXposedHookLoadPackage {
+public class HookMain {
     public static final MediaPlayerManager playerManager = new MediaPlayerManager();
     public static final Camera2SessionHook camera2Hook = new Camera2SessionHook(playerManager);
 
@@ -139,19 +141,9 @@ public class HookMain implements IXposedHookLoadPackage {
     // Entry point
     // =====================================================================
 
-    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Exception {
-        // Hook self to return true for isModuleActive
-        if (lpparam.packageName.equals("io.github.zensu357.camswap")) {
-            XposedHelpers.findAndHookMethod("io.github.zensu357.camswap.MainActivity", lpparam.classLoader, "isModuleActive",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                            param.setResult(true);
-                        }
-                    });
-            return; // 模块自身只需要 hook isModuleActive，不需要注入 Camera/Mic 等 Hook
-        }
-
+    public void handleLoadPackage(final Api101PackageContext packageContext) throws Exception {
+        final ClassLoader classLoader = packageContext.classLoader;
+        final String packageName = packageContext.packageName;
         // Check if module is disabled
         if (getConfig().getBoolean(ConfigManager.KEY_DISABLE_MODULE, false)) {
             LogUtil.log("【CS】模块已被配置禁用");
@@ -159,160 +151,322 @@ public class HookMain implements IXposedHookLoadPackage {
         }
 
         Set<String> targetPackages = getConfig().getTargetPackages();
-        if (!targetPackages.isEmpty() && !targetPackages.contains(lpparam.packageName)) {
+        if (!targetPackages.isEmpty() && !targetPackages.contains(packageName)) {
             return;
         }
 
+        camera2Hook.setCurrentPackageName(packageName);
+
         // Initialize Camera Handlers
-        new Camera1Handler().init(lpparam);
-        new Camera2Handler().init(lpparam);
+        new Camera1Handler().init(packageContext);
+        new Camera2Handler().init(packageContext);
 
         // Initialize Microphone Handler
-        new MicrophoneHandler().init(lpparam);
+        new MicrophoneHandler().init(packageContext);
 
-        XposedHelpers.findAndHookMethod("android.media.MediaRecorder", lpparam.classLoader, "setCamera", Camera.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                        super.beforeHookedMethod(param);
-                        need_to_show_toast = !getConfig().getBoolean(ConfigManager.KEY_DISABLE_TOAST, false);
-                        LogUtil.log("【CS】[record]" + lpparam.packageName);
-                        if (toast_content != null && need_to_show_toast) {
-                            try {
-                                showToast("应用：" + lpparam.appInfo.name + "(" + lpparam.packageName + ")"
-                                        + "触发了录像，但目前无法拦截");
-                            } catch (Exception ee) {
-                                LogUtil.log("【CS】[toast]" + Arrays.toString(ee.getStackTrace()));
-                            }
-                        }
-                    }
-                });
+        hookMediaRecorderSetCamera(classLoader, packageName, packageContext);
+        hookCallApplicationOnCreate(classLoader, packageName);
+        hookImageReaderNewInstance(classLoader);
+        hookImageReaderAcquireMethods(classLoader);
+        hookImageReaderListener(classLoader);
+        hookCaptureFailed(classLoader);
+    }
 
-        XposedHelpers.findAndHookMethod("android.app.Instrumentation", lpparam.classLoader, "callApplicationOnCreate",
-                Application.class, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        super.afterHookedMethod(param);
-                        if (param.args[0] instanceof Application) {
-                            try {
-                                toast_content = ((Application) param.args[0]).getApplicationContext();
-                                VideoManager.setContext(toast_content);
-                                checkProviderAvailability();
-
-                                getConfig().setContext(toast_content);
-                                getConfig().forceReload();
-                                VideoManager.updateVideoPath(false);
-                                LogUtil.log("【CS】Application.onCreate 预热：配置和视频路径已加载");
-
-                                initContentObserver(toast_content);
-
-                                try {
-                                    NativeAudioHook.init();
-                                    LogUtil.log("【CS】Native audio hooks initialized");
-                                } catch (Throwable t) {
-                                    LogUtil.log("【CS】Native audio hooks init failed: " + t);
-                                }
-                            } catch (Exception ee) {
-                                LogUtil.log("【CS】" + ee.toString());
-                            }
-
-                            PermissionHelper.checkAndSetupPaths(toast_content, lpparam.packageName);
-                        }
-                    }
-                });
-
-        XC_MethodHook imageReaderNewInstanceHook = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                if (param.args == null || param.args.length < 3) {
-                    return;
-                }
-                LogUtil.log("【CS】应用创建了渲染器：宽：" + param.args[0] + " 高：" + param.args[1] + "格式" + param.args[2]);
-                c2_ori_width = (int) param.args[0];
-                c2_ori_height = (int) param.args[1];
-                imageReaderFormat = (int) param.args[2];
-                need_to_show_toast = !getConfig().getBoolean(ConfigManager.KEY_DISABLE_TOAST, false);
-                if (toast_content != null && need_to_show_toast) {
-                    try {
-                        showToast("应用创建了渲染器：\n宽：" + param.args[0] + "\n高：" + param.args[1] + "\n一般只需要宽高比与视频相同");
-                    } catch (Exception e) {
-                        LogUtil.log("【CS】[toast]" + e.toString());
-                    }
-                }
-            }
-
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
+    private void hookMediaRecorderSetCamera(ClassLoader classLoader, String packageName,
+            Api101PackageContext packageContext) {
+        try {
+            Method method = resolveMethod(classLoader, "android.media.MediaRecorder", "setCamera", Camera.class);
+            Api101Runtime.requireModule().hook(method).intercept(chain -> {
+                Object[] args = toArgs(chain.getArgs());
                 try {
-                    if (getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)) {
-                        Object imageReader = param.getResult();
-                        if (imageReader != null) {
-                            Surface surface = (Surface) XposedHelpers.callMethod(imageReader, "getSurface");
-                            if (surface != null) {
-                                int width = (int) param.args[0];
-                                int height = (int) param.args[1];
-                                int format = (int) param.args[2];
-                                camera2Hook.registerImageReaderSurface(surface, format, width, height);
-                                LogUtil.log("【CS】已记录 ImageReader Surface: " + surface + " format=" + format);
-                            }
+                    need_to_show_toast = !getConfig().getBoolean(ConfigManager.KEY_DISABLE_TOAST, false);
+                    LogUtil.log("【CS】[record]" + packageName);
+                    if (toast_content != null && need_to_show_toast) {
+                        try {
+                            showToast("应用：" + packageContext.appInfo.name + "(" + packageName + ")"
+                                    + "触发了录像，但目前无法拦截");
+                        } catch (Exception ee) {
+                            LogUtil.log("【CS】[toast]" + Arrays.toString(ee.getStackTrace()));
                         }
                     }
-                } catch (Exception e) {
-                    LogUtil.log("【CS】记录 ImageReader 失败: " + e);
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】MediaRecorder.setCamera before 异常: " + t);
                 }
-            }
-        };
+                return chain.proceed(args);
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook MediaRecorder.setCamera 失败: " + t);
+        }
+    }
 
-        XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "newInstance", int.class,
-                int.class, int.class, int.class, imageReaderNewInstanceHook);
+    private void hookCallApplicationOnCreate(ClassLoader classLoader, String packageName) {
+        try {
+            Method method = resolveMethod(classLoader, "android.app.Instrumentation", "callApplicationOnCreate",
+                    Application.class);
+            Api101Runtime.requireModule().hook(method).intercept(chain -> {
+                Object[] args = toArgs(chain.getArgs());
+                Object result = chain.proceed(args);
+                try {
+                    if (args.length > 0 && args[0] instanceof Application) {
+                        toast_content = ((Application) args[0]).getApplicationContext();
+                        VideoManager.setContext(toast_content);
+                        checkProviderAvailability();
+
+                        getConfig().setContext(toast_content);
+                        getConfig().forceReload();
+                        VideoManager.updateVideoPath(false);
+                        LogUtil.log("【CS】Application.onCreate 预热：配置和视频路径已加载");
+
+                        initContentObserver(toast_content);
+
+                        try {
+                            NativeAudioHook.init();
+                            LogUtil.log("【CS】Native audio hooks initialized");
+                        } catch (Throwable t) {
+                            LogUtil.log("【CS】Native audio hooks init failed: " + t);
+                        }
+
+                        PermissionHelper.checkAndSetupPaths(toast_content, packageName);
+                    }
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】callApplicationOnCreate after 异常: " + t);
+                }
+                return result;
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook callApplicationOnCreate 失败: " + t);
+        }
+    }
+
+    private void hookImageReaderNewInstance(ClassLoader classLoader) {
+        hookImageReaderNewInstance(classLoader, int.class, int.class, int.class, int.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            hookImageReaderNewInstance(classLoader, int.class, int.class, int.class, int.class, long.class);
+        }
+    }
+
+    private void hookImageReaderNewInstance(ClassLoader classLoader, Class<?>... parameterTypes) {
+        try {
+            Method method = resolveMethod(classLoader, "android.media.ImageReader", "newInstance", parameterTypes);
+            Api101Runtime.requireModule().hook(method).intercept(chain -> {
+                Object[] args = toArgs(chain.getArgs());
+                try {
+                    onImageReaderNewInstanceBefore(args);
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】ImageReader.newInstance before 异常: " + t);
+                }
+
+                Object result = chain.proceed(args);
+
+                try {
+                    onImageReaderNewInstanceAfter(args, result);
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】ImageReader.newInstance after 异常: " + t);
+                }
+                return result;
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook ImageReader.newInstance 失败: " + t);
+        }
+    }
+
+    private void hookImageReaderAcquireMethods(ClassLoader classLoader) {
+        hookImageReaderAcquireMethod(classLoader, "acquireNextImage");
+        hookImageReaderAcquireMethod(classLoader, "acquireLatestImage");
+    }
+
+    private void hookImageReaderAcquireMethod(ClassLoader classLoader, String methodName) {
+        try {
+            Method method = resolveMethod(classLoader, "android.media.ImageReader", methodName);
+            XposedInterface.Invoker<?, Method> originInvoker = Api101Runtime.requireModule()
+                    .getInvoker(method)
+                    .setType(XposedInterface.Invoker.Type.ORIGIN);
+            Api101Runtime.requireModule().hook(method).intercept(chain -> interceptImageReaderAcquire(chain, originInvoker));
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook ImageReader." + methodName + " 失败: " + t);
+        }
+    }
+
+    private Object interceptImageReaderAcquire(XposedInterface.Chain chain,
+            XposedInterface.Invoker<?, Method> originInvoker) throws Throwable {
+        Object[] args = toArgs(chain.getArgs());
+        Object thisObject = chain.getThisObject();
+        if (!(thisObject instanceof ImageReader)) {
+            return chain.proceed(args);
+        }
+
+        ImageReader imageReader = (ImageReader) thisObject;
+        Surface surface = imageReader.getSurface();
+        Object result;
+
+        if (camera2Hook.shouldBypassYuvAcquireHook(surface)
+                || !camera2Hook.shouldKeepYuvReaderSurfaceForCurrentPackage(surface)) {
+            result = chain.proceed(args);
+        } else {
             try {
-                XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "newInstance", int.class,
-                        int.class, int.class, int.class, long.class, imageReaderNewInstanceHook);
+                result = acquireFakeWhatsAppYuvImage(imageReader, surface, args, originInvoker);
             } catch (Throwable t) {
-                LogUtil.log("【CS】Hook ImageReader.newInstance(usage) 失败: " + t);
+                LogUtil.log("【CS】WhatsApp YUV ImageReader 兼容处理失败: " + t);
+                result = chain.proceed(args);
             }
         }
 
-        XC_MethodHook acquireImageHook = new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
-                try {
-                    if (!getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)) {
-                        return;
-                    }
-                    Object imageReader = param.thisObject;
-                    if (imageReader == null) {
-                        return;
-                    }
-                    Surface surface = (Surface) XposedHelpers.callMethod(imageReader, "getSurface");
-                    if (!camera2Hook.isJpegReaderSurface(surface)) {
-                        return;
-                    }
-                    Image image = (Image) param.getResult();
-                    if (image == null) {
-                        return;
-                    }
-                    camera2Hook.replaceJpegImageIfNeeded(imageReader, image);
-                } catch (Exception e) {
-                    LogUtil.log("【CS】处理 ImageReader 结果失败: " + e);
-                }
+        return maybeReplaceJpegImage(imageReader, surface, result);
+    }
+
+    private Object acquireFakeWhatsAppYuvImage(ImageReader imageReader, Surface surface, Object[] args,
+            XposedInterface.Invoker<?, Method> originInvoker) throws Throwable {
+        try {
+            Object result = camera2Hook.acquireFakeWhatsAppYuvImage(imageReader, surface);
+            drainOriginImage(originInvoker, imageReader, args);
+            return result;
+        } catch (Throwable ignored) {
+            Object fallback = camera2Hook.acquireFakeWhatsAppYuvImage(imageReader, surface);
+            drainOriginImage(originInvoker, imageReader, args);
+            return fallback;
+        }
+    }
+
+    private void drainOriginImage(XposedInterface.Invoker<?, Method> originInvoker, ImageReader imageReader,
+            Object[] args) {
+        try {
+            Image realImage = (Image) invokeOrigin(originInvoker, imageReader, args);
+            if (realImage != null) {
+                realImage.close();
             }
-        };
+        } catch (Throwable ignored) {
+            // drain 失败（例如无帧可取或格式异常），安全忽略
+        }
+    }
 
-        XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextImage",
-                acquireImageHook);
-        XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireLatestImage",
-                acquireImageHook);
+    private Object maybeReplaceJpegImage(ImageReader imageReader, Surface surface, Object result) {
+        if (!(result instanceof Image)) {
+            return result;
+        }
+        try {
+            if (!getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)) {
+                return result;
+            }
+            if (!camera2Hook.isJpegReaderSurface(surface)) {
+                return result;
+            }
+            camera2Hook.replaceJpegImageIfNeeded(imageReader, (Image) result);
+        } catch (Exception e) {
+            LogUtil.log("【CS】处理 ImageReader 结果失败: " + e);
+        }
+        return result;
+    }
 
-        XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession.CaptureCallback",
-                lpparam.classLoader, "onCaptureFailed", CameraCaptureSession.class, CaptureRequest.class,
-                CaptureFailure.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        LogUtil.log("【CS】onCaptureFailed" + "原因：" + ((CaptureFailure) param.args[2]).getReason());
+    private void onImageReaderNewInstanceBefore(Object[] args) {
+        if (args == null || args.length < 3) {
+            return;
+        }
+        LogUtil.log("【CS】应用创建了渲染器：宽：" + args[0] + " 高：" + args[1] + "格式" + args[2]);
+        c2_ori_width = (int) args[0];
+        c2_ori_height = (int) args[1];
+        imageReaderFormat = (int) args[2];
+        need_to_show_toast = !getConfig().getBoolean(ConfigManager.KEY_DISABLE_TOAST, false);
+        if (toast_content != null && need_to_show_toast) {
+            try {
+                showToast("应用创建了渲染器：\n宽：" + args[0] + "\n高：" + args[1] + "\n一般只需要宽高比与视频相同");
+            } catch (Exception e) {
+                LogUtil.log("【CS】[toast]" + e.toString());
+            }
+        }
+    }
+
+    private void onImageReaderNewInstanceAfter(Object[] args, Object result) {
+        if (camera2Hook.shouldSkipImageReaderTracking()) {
+            return;
+        }
+        if (!(result instanceof ImageReader) || args == null || args.length < 3) {
+            return;
+        }
+        Surface surface = ((ImageReader) result).getSurface();
+        if (surface == null) {
+            return;
+        }
+        int width = (int) args[0];
+        int height = (int) args[1];
+        int format = (int) args[2];
+        camera2Hook.registerImageReaderSurface(surface, format, width, height);
+        LogUtil.log("【CS】已记录 ImageReader Surface: " + surface + " format=" + format);
+    }
+
+    private void hookImageReaderListener(ClassLoader classLoader) {
+        try {
+            Method method = resolveMethod(classLoader, "android.media.ImageReader", "setOnImageAvailableListener",
+                    android.media.ImageReader.OnImageAvailableListener.class, android.os.Handler.class);
+            Api101Runtime.requireModule().hook(method).intercept(chain -> {
+                Object[] args = toArgs(chain.getArgs());
+                Object result = chain.proceed(args);
+                try {
+                    camera2Hook.updateImageReaderListener(chain.getThisObject(), args[0],
+                            (android.os.Handler) args[1]);
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】更新 WhatsApp YUV listener 失败: " + t);
+                }
+                return result;
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook ImageReader.setOnImageAvailableListener 失败: " + t);
+        }
+    }
+
+    private void hookCaptureFailed(ClassLoader classLoader) {
+        try {
+            Method method = resolveMethod(CameraCaptureSession.CaptureCallback.class, "onCaptureFailed",
+                    CameraCaptureSession.class, CaptureRequest.class, CaptureFailure.class);
+            Api101Runtime.requireModule().hook(method).intercept(chain -> {
+                Object[] args = toArgs(chain.getArgs());
+                try {
+                    if (args.length > 2 && args[2] instanceof CaptureFailure) {
+                        LogUtil.log("【CS】onCaptureFailed原因：" + ((CaptureFailure) args[2]).getReason());
                     }
-                });
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】onCaptureFailed before 异常: " + t);
+                }
+                return chain.proceed(args);
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook CaptureCallback.onCaptureFailed 失败: " + t);
+        }
+    }
+
+    private static Object invokeOrigin(XposedInterface.Invoker<?, Method> originInvoker, Object thisObject,
+            Object[] args) throws Throwable {
+        try {
+            return originInvoker.invoke(thisObject, args);
+        } catch (InvocationTargetException e) {
+            Throwable target = e.getTargetException();
+            if (target != null) {
+                throw target;
+            }
+            throw e;
+        }
+    }
+
+    private static Method resolveMethod(ClassLoader classLoader, String className,
+            String methodName, Class<?>... parameterTypes) throws Exception {
+        return resolveMethod(Class.forName(className, false, classLoader), methodName, parameterTypes);
+    }
+
+    private static Method resolveMethod(Class<?> clazz, String methodName, Class<?>... parameterTypes)
+            throws NoSuchMethodException {
+        Class<?> current = clazz;
+        while (current != null) {
+            try {
+                Method method = current.getDeclaredMethod(methodName, parameterTypes);
+                method.setAccessible(true);
+                return method;
+            } catch (NoSuchMethodException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchMethodException(clazz.getName() + "#" + methodName);
+    }
+
+    private static Object[] toArgs(List<Object> args) {
+        return args.toArray(new Object[0]);
     }
 }

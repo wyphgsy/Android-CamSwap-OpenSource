@@ -2,13 +2,16 @@ package io.github.zensu357.camswap.utils;
 
 import android.util.Log;
 
+import io.github.zensu357.camswap.api101.Api101Runtime;
+
 public class LogUtil {
     public static void log(String message) {
-        if (message == null) message = "null";
-        try {
-            Class<?> xposedBridge = Class.forName("de.robv.android.xposed.XposedBridge");
-            xposedBridge.getMethod("log", String.class).invoke(null, message);
-        } catch (Throwable t) {
+        if (message == null) {
+            message = "null";
+        }
+        if (Api101Runtime.getModule() != null) {
+            Api101Runtime.getModule().log(Log.INFO, "CamSwap", message);
+        } else {
             Log.i("LSPosed-Bridge", message);
         }
     }

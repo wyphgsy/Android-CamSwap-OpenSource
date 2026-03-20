@@ -37,19 +37,24 @@ public class ConfigManager {
     public static final String KEY_SELECTED_VIDEO = "selected_video";
     public static final String KEY_ORIGINAL_VIDEO_NAME = "original_video_name";
     public static final String KEY_SELECTED_IMAGE = "selected_image";
+    public static final String KEY_REPLACE_MODE = "replace_mode";
     public static final String KEY_ENABLE_MIC_HOOK = "enable_mic_hook";
     public static final String KEY_MIC_HOOK_MODE = "mic_hook_mode"; // "mute" | "replace" | "video_sync"
     public static final String KEY_SELECTED_AUDIO = "selected_audio"; // 音频文件名
+    public static final String KEY_NOTIFICATION_CONTROL_ENABLED = "notification_control_enabled";
     public static final String MIC_MODE_MUTE = "mute";
     public static final String MIC_MODE_REPLACE = "replace";
     public static final String MIC_MODE_VIDEO_SYNC = "video_sync";
+    public static final String REPLACE_MODE_VIDEO = "video";
+    public static final String REPLACE_MODE_IMAGE = "image";
     public static final String KEY_VIDEO_ROTATION_OFFSET = "video_rotation_offset"; // 视频旋转偏移角度
     public static final String KEY_ENABLE_PHOTO_FAKE = "enable_photo_fake"; // 启用拍照替换 (动态防御)
+    public static final String KEY_ENABLE_WHATSAPP_CAMERA2_COMPAT = "enable_whatsapp_camera2_compat";
 
     // Broadcast Actions
-    public static final String ACTION_UPDATE_CONFIG = "io.github.zensu357.camswap.ACTION_UPDATE_CONFIG";
-    public static final String ACTION_REQUEST_CONFIG = "io.github.zensu357.camswap.ACTION_REQUEST_CONFIG";
-    public static final String EXTRA_CONFIG_JSON = "config_json";
+    public static final String ACTION_UPDATE_CONFIG = IpcContract.ACTION_UPDATE_CONFIG;
+    public static final String ACTION_REQUEST_CONFIG = IpcContract.ACTION_REQUEST_CONFIG;
+    public static final String EXTRA_CONFIG_JSON = IpcContract.EXTRA_CONFIG_JSON;
 
     // Fallback switch
     public static boolean ENABLE_LEGACY_FILE_ACCESS = true;
@@ -114,7 +119,7 @@ public class ConfigManager {
     }
 
     private boolean reloadFromProvider() {
-        android.net.Uri uri = android.net.Uri.parse("content://io.github.zensu357.camswap.provider/config");
+        android.net.Uri uri = IpcContract.URI_CONFIG;
         try (android.database.Cursor cursor = context.getContentResolver().query(uri, null, null, null, null)) {
             if (cursor != null) {
                 JSONObject newConfig = new JSONObject();
@@ -167,7 +172,7 @@ public class ConfigManager {
      */
     public void requestConfig(Context context) {
         try {
-            android.content.Intent intent = new android.content.Intent(ACTION_REQUEST_CONFIG);
+            android.content.Intent intent = new android.content.Intent(IpcContract.ACTION_REQUEST_CONFIG);
             intent.setPackage("io.github.zensu357.camswap"); // Explicit intent to wake up host receiver
             context.sendBroadcast(intent);
             io.github.zensu357.camswap.utils.LogUtil.log("【CS】已发送配置请求广播 config request broadcast sent");
@@ -181,8 +186,8 @@ public class ConfigManager {
      */
     public void sendConfigBroadcast(Context context) {
         try {
-            android.content.Intent intent = new android.content.Intent(ACTION_UPDATE_CONFIG);
-            intent.putExtra(EXTRA_CONFIG_JSON, configData.toString());
+            android.content.Intent intent = new android.content.Intent(IpcContract.ACTION_UPDATE_CONFIG);
+            intent.putExtra(IpcContract.EXTRA_CONFIG_JSON, configData.toString());
 
             if (getBoolean(KEY_FORCE_PRIVATE_DIR, false)) {
                 String videoName = getString(KEY_SELECTED_VIDEO, "Cam.mp4");
@@ -206,7 +211,7 @@ public class ConfigManager {
                         android.os.Bundle bundle = new android.os.Bundle();
                         io.github.zensu357.camswap.utils.LogUtil
                                 .log("【CS】准备附加 video_binder: " + finalVideoFile.getAbsolutePath());
-                        bundle.putBinder("video_binder", new android.os.Binder() {
+                        bundle.putBinder(IpcContract.EXTRA_VIDEO_BINDER, new android.os.Binder() {
                             @Override
                             protected boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply,
                                     int flags) throws android.os.RemoteException {
@@ -229,7 +234,7 @@ public class ConfigManager {
                                 return super.onTransact(code, data, reply, flags);
                             }
                         });
-                        intent.putExtra("video_bundle", bundle);
+                        intent.putExtra(IpcContract.EXTRA_VIDEO_BUNDLE, bundle);
                     } catch (Exception e) {
                         io.github.zensu357.camswap.utils.LogUtil.log("【CS】广播附加 video_bundle 失败: " + e);
                     }
@@ -391,8 +396,7 @@ public class ConfigManager {
             // Notify ContentObserver and broadcast changes
             if (context != null) {
                 try {
-                    android.net.Uri uri = android.net.Uri.parse("content://io.github.zensu357.camswap.provider/config");
-                    context.getContentResolver().notifyChange(uri, null);
+                    context.getContentResolver().notifyChange(IpcContract.URI_CONFIG, null);
                 } catch (Exception ignored) {
                 }
                 sendConfigBroadcast(context);

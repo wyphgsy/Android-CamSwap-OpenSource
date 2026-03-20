@@ -18,10 +18,6 @@ public class NotificationService extends Service {
     private static final String CHANNEL_ID = "camswap_control_channel";
     private static final int NOTIFICATION_ID = 1001;
 
-    private static final String ACTION_NEXT = "io.github.zensu357.camswap.ACTION_CAMSWAP_NEXT";
-    private static final String ACTION_EXIT = "io.github.zensu357.camswap.ACTION_CAMSWAP_EXIT";
-    private static final String ACTION_ROTATE = "io.github.zensu357.camswap.ACTION_CAMSWAP_ROTATE";
-
     private ConfigManager configManager;
     private int currentRotationOffset = 0;
 
@@ -30,9 +26,9 @@ public class NotificationService extends Service {
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
             android.util.Log.d("Camswap_NOTIF", "收到操作指令: " + action);
-            if (ACTION_EXIT.equals(action)) {
+            if (IpcContract.ACTION_EXIT.equals(action)) {
                 stopSelf();
-            } else if (ACTION_ROTATE.equals(action)) {
+            } else if (IpcContract.ACTION_ROTATE.equals(action)) {
                 // 循环切换旋转偏移: 0 -> 90 -> 180 -> 270 -> 0
                 currentRotationOffset = (currentRotationOffset + 90) % 360;
                 if (configManager != null) {
@@ -65,8 +61,8 @@ public class NotificationService extends Service {
         currentRotationOffset = configManager.getInt(ConfigManager.KEY_VIDEO_ROTATION_OFFSET, 0);
 
         IntentFilter filter = new IntentFilter();
-        filter.addAction(ACTION_EXIT);
-        filter.addAction(ACTION_ROTATE);
+        filter.addAction(IpcContract.ACTION_EXIT);
+        filter.addAction(IpcContract.ACTION_ROTATE);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(controlReceiver, filter, Context.RECEIVER_EXPORTED);
@@ -118,7 +114,7 @@ public class NotificationService extends Service {
                 getRotatePendingIntent()).build());
 
         builder.addAction(new Notification.Action.Builder(null, getString(R.string.notif_action_exit),
-                getPendingIntent(ACTION_EXIT)).build());
+                getPendingIntent(IpcContract.ACTION_EXIT)).build());
 
         return builder.build();
     }
@@ -131,14 +127,14 @@ public class NotificationService extends Service {
     }
 
     private PendingIntent getNextPendingIntent() {
-        Intent intent = new Intent(ACTION_NEXT);
-        return PendingIntent.getBroadcast(this, ACTION_NEXT.hashCode(), intent,
+        Intent intent = new Intent(IpcContract.ACTION_NEXT);
+        return PendingIntent.getBroadcast(this, IpcContract.ACTION_NEXT.hashCode(), intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
 
     private PendingIntent getRotatePendingIntent() {
-        Intent intent = new Intent(ACTION_ROTATE);
-        return PendingIntent.getBroadcast(this, ACTION_ROTATE.hashCode(), intent,
+        Intent intent = new Intent(IpcContract.ACTION_ROTATE);
+        return PendingIntent.getBroadcast(this, IpcContract.ACTION_ROTATE.hashCode(), intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
 

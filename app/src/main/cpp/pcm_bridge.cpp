@@ -95,25 +95,20 @@ void pcm_bridge_init(JNIEnv* env, jclass hookClass) {
 
 int fill_fake_pcm(void* buffer, int sizeBytes, int sampleRate, int channels) {
     if (!g_bridge_ready || sizeBytes <= 0) {
-        // Bridge not ready — fill silence as fallback
-        if (buffer && sizeBytes > 0) {
-            memset(buffer, 0, sizeBytes);
-        }
-        return sizeBytes;
+        // Bridge not ready — passthrough (don't touch buffer)
+        return -1;
     }
 
     JNIEnv* env = get_env();
     if (!env) {
-        memset(buffer, 0, sizeBytes);
-        return sizeBytes;
+        return -1;
     }
 
     jbyteArray jbuf = env->NewByteArray(sizeBytes);
     if (!jbuf) {
         LOGE("fill_fake_pcm: NewByteArray(%d) failed", sizeBytes);
         env->ExceptionClear();
-        memset(buffer, 0, sizeBytes);
-        return sizeBytes;
+        return -1;
     }
 
     jint result = env->CallStaticIntMethod(g_hook_class, g_fill_method,
@@ -123,8 +118,7 @@ int fill_fake_pcm(void* buffer, int sizeBytes, int sampleRate, int channels) {
         env->ExceptionDescribe();
         env->ExceptionClear();
         env->DeleteLocalRef(jbuf);
-        memset(buffer, 0, sizeBytes);
-        return sizeBytes;
+        return -1;
     }
 
     if (result < 0) {

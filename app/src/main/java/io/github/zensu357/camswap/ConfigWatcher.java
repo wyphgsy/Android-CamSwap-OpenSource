@@ -54,8 +54,7 @@ public final class ConfigWatcher {
 
         boolean observerRegistered = false;
         try {
-            android.net.Uri uri = android.net.Uri.parse("content://io.github.zensu357.camswap.provider/config");
-            context.getContentResolver().registerContentObserver(uri, true, configObserver);
+            context.getContentResolver().registerContentObserver(IpcContract.URI_CONFIG, true, configObserver);
             observerRegistered = true;
         } catch (Exception e) {
             LogUtil.log("【CS】注册配置监听器失败: " + e);
@@ -104,19 +103,19 @@ public final class ConfigWatcher {
                     String action = intent.getAction();
                     LogUtil.log("【CS】收到广播指令: " + action);
 
-                    if (ConfigManager.ACTION_UPDATE_CONFIG.equals(action)) {
+                    if (IpcContract.ACTION_UPDATE_CONFIG.equals(action)) {
                         handleConfigUpdate(intent);
-                    } else if ("io.github.zensu357.camswap.ACTION_CAMSWAP_NEXT".equals(action)) {
+                    } else if (IpcContract.ACTION_NEXT.equals(action)) {
                         handleNextVideo();
-                    } else if ("io.github.zensu357.camswap.ACTION_CAMSWAP_ROTATE".equals(action)) {
+                    } else if (IpcContract.ACTION_ROTATE.equals(action)) {
                         handleRotate();
                     }
                 }
             };
             IntentFilter filter = new IntentFilter();
-            filter.addAction(ConfigManager.ACTION_UPDATE_CONFIG);
-            filter.addAction("io.github.zensu357.camswap.ACTION_CAMSWAP_NEXT");
-            filter.addAction("io.github.zensu357.camswap.ACTION_CAMSWAP_ROTATE");
+            filter.addAction(IpcContract.ACTION_UPDATE_CONFIG);
+            filter.addAction(IpcContract.ACTION_NEXT);
+            filter.addAction(IpcContract.ACTION_ROTATE);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } else {
@@ -130,14 +129,14 @@ public final class ConfigWatcher {
 
     private void handleConfigUpdate(Intent intent) {
         ConfigManager config = VideoManager.getConfig();
-        String configJson = intent.getStringExtra(ConfigManager.EXTRA_CONFIG_JSON);
+        String configJson = intent.getStringExtra(IpcContract.EXTRA_CONFIG_JSON);
         if (configJson == null)
             return;
 
         // Snapshot old values
         String oldVideo = config.getString(ConfigManager.KEY_SELECTED_VIDEO, "");
         String oldImage = config.getString(ConfigManager.KEY_SELECTED_IMAGE, "");
-        String oldMode = config.getString("replace_mode", "video");
+        String oldMode = config.getString(ConfigManager.KEY_REPLACE_MODE, ConfigManager.REPLACE_MODE_VIDEO);
         boolean oldFpd = config.getBoolean(ConfigManager.KEY_FORCE_PRIVATE_DIR, false);
         int oldRotation = config.getInt(ConfigManager.KEY_VIDEO_ROTATION_OFFSET, 0);
 
@@ -146,7 +145,7 @@ public final class ConfigWatcher {
         // Snapshot new values
         String newVideo = config.getString(ConfigManager.KEY_SELECTED_VIDEO, "");
         String newImage = config.getString(ConfigManager.KEY_SELECTED_IMAGE, "");
-        String newMode = config.getString("replace_mode", "video");
+        String newMode = config.getString(ConfigManager.KEY_REPLACE_MODE, ConfigManager.REPLACE_MODE_VIDEO);
         boolean newFpd = config.getBoolean(ConfigManager.KEY_FORCE_PRIVATE_DIR, false);
         int newRotation = config.getInt(ConfigManager.KEY_VIDEO_ROTATION_OFFSET, 0);
 
@@ -172,13 +171,13 @@ public final class ConfigWatcher {
     }
 
     private void extractVideoFromBinder(Intent intent) {
-        android.os.Bundle bundle = intent.getBundleExtra("video_bundle");
+        android.os.Bundle bundle = intent.getBundleExtra(IpcContract.EXTRA_VIDEO_BUNDLE);
         if (bundle == null) {
             LogUtil.log("【CS】并没有找到 video_bundle 额外数据");
             return;
         }
         LogUtil.log("【CS】成功获取到 video_bundle");
-        android.os.IBinder binder = bundle.getBinder("video_binder");
+        android.os.IBinder binder = bundle.getBinder(IpcContract.EXTRA_VIDEO_BINDER);
         if (binder == null) {
             LogUtil.log("【CS】bundle.getBinder 返回 null");
             return;

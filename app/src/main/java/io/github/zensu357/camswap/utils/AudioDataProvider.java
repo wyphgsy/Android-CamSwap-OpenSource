@@ -48,12 +48,73 @@ public class AudioDataProvider {
     public static final String DEFAULT_AUDIO_NAME = "Mic.mp3";
 
     /**
-     * 获取音频文件路径
+     * 获取音频文件路径。
+     * 当 force_private_dir 模式时，优先使用私有目录拷贝的音频文件，
+     * 如果没有则通过 ContentProvider 获取并拷贝。
      */
     public static String getAudioFilePath() {
         String audioDir = VideoManager.video_path;
         String selectedAudio = VideoManager.getConfig().getString(
                 io.github.zensu357.camswap.ConfigManager.KEY_SELECTED_AUDIO, null);
+
+        // 1. 尝试在当前 video_path 目录下查找
+        String localResult = findAudioInDir(audioDir, selectedAudio);
+        if (localResult != null) {
+            return localResult;
+        }
+
+        // 2. force_private_dir 模式下，尝试查找已拷贝到私有目录的音频
+        boolean forcePrivate = VideoManager.getConfig().getBoolean(
+                io.github.zensu357.camswap.ConfigManager.KEY_FORCE_PRIVATE_DIR, false);
+        if (forcePrivate) {
+            // 检查是否已经有私有目录的音频文件
+            try {
+                android.content.Context ctx = getContextReflection();
+                if (ctx != null) {
+                    java.io.File privateAudio = new java.io.File(ctx.getFilesDir(), "vcam_private_audio");
+                    if (privateAudio.exists() && privateAudio.length() > 0) {
+                        LogUtil.log(TAG + " 使用私有目录音频: " + privateAudio.getAbsolutePath());
+                        return privateAudio.getAbsolutePath();
+                    }
+                }
+            } catch (Exception e) {
+                LogUtil.log(TAG + " 检查私有目录音频失败: " + e);
+            }
+
+            // 尝试通过 ContentProvider 拷贝
+            LogUtil.log(TAG + " 本地目录无音频文件 (dir=" + audioDir
+                    + ", selected=" + selectedAudio + ")，尝试通过 Provider 拷贝");
+            String privatePath = VideoManager.copyAudioToPrivateDir();
+            if (privatePath != null) {
+                LogUtil.log(TAG + " Provider 拷贝音频成功: " + privatePath);
+                return privatePath;
+            }
+
+            // 3. 也尝试在原始公共目录查找（forcePrivate 但实际文件可能没被重定向）
+            String publicDir = io.github.zensu357.camswap.ConfigManager.DEFAULT_CONFIG_DIR;
+            if (!publicDir.equals(audioDir)) {
+                localResult = findAudioInDir(publicDir, selectedAudio);
+                if (localResult != null) {
+                    LogUtil.log(TAG + " 在公共目录找到音频: " + localResult);
+                    return localResult;
+                }
+            }
+
+            LogUtil.log(TAG + " ⚠ 所有路径均未找到音频文件！selected=" + selectedAudio);
+        } else {
+            LogUtil.log(TAG + " 本地目录无音频文件 (dir=" + audioDir
+                    + ", selected=" + selectedAudio + ")");
+        }
+
+        return null;
+    }
+
+    /**
+     * 在指定目录下查找音频文件。
+     * 查找顺序：selectedAudio → Mic.mp3 → 目录中任意音频文件。
+     */
+    private static String findAudioInDir(String audioDir, String selectedAudio) {
+        if (audioDir == null) return null;
 
         if (selectedAudio != null && !selectedAudio.isEmpty()) {
             File selected = new File(audioDir, selectedAudio);
@@ -83,6 +144,20 @@ public class AudioDataProvider {
         }
 
         return null;
+    }
+
+    /**
+     * 通过反射获取 Context（避免直接依赖 HookMain 造成循环导入）。
+     */
+    private static android.content.Context getContextReflection() {
+        try {
+            // 优先从 VideoManager 获取
+            java.lang.reflect.Field ctxField = VideoManager.class.getDeclaredField("toast_content");
+            ctxField.setAccessible(true);
+            return (android.content.Context) ctxField.get(null);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

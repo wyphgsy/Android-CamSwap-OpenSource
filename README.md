@@ -81,11 +81,16 @@ Hook 层（Xposed 模块核心）采用模块化设计：
 *   JDK 17+
 *   Android SDK Platform 34
 
+如果本机 JDK 路径与仓库历史配置不一致，优先通过 `JAVA_HOME` 或未提交的 `local.properties` 覆盖，不要把机器相关路径写回版本库。
+
 ### 克隆仓库
 ```bash
 git clone https://github.com/zensu357/Android-CamSwap-OpenSource.git
 cd Android-CamSwap-OpenSource
+git submodule update --init --recursive
 ```
+
+> `app/src/main/cpp/third_party/Dobby` 依赖 Git submodule；如果缺失，CMake / Gradle 会在 native 配置阶段失败。
 
 ### 配置签名（可选）
 编译 Debug 包无需任何签名配置，直接运行：

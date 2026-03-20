@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">CamSwap</string>
+    <string name="module_description">安卓虚拟摄像头</string>
     <string name="click_to_go_to_repo">前往 GitHub 仓库</string>
     <string name="description">请访问在线仓库查看最新更新、使用教程及反馈问题</string>
     <string name="Warning">严禁用于任何非法用途！！使用者需自行承担所有责任与后果！！</string>

@@ -56,7 +56,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     enableMicHook = configManager.getBoolean(ConfigManager.KEY_ENABLE_MIC_HOOK, false),
                     micHookMode = configManager.getString(ConfigManager.KEY_MIC_HOOK_MODE, ConfigManager.MIC_MODE_MUTE),
                     enablePhotoFake = configManager.getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false),
-                    notificationControlEnabled = configManager.getBoolean("notification_control_enabled", false),
+                    notificationControlEnabled = configManager.getBoolean(ConfigManager.KEY_NOTIFICATION_CONTROL_ENABLED, false),
                     targetAppsCount = configManager.targetPackages.size,
                     originalVideoName = configManager.getString(ConfigManager.KEY_ORIGINAL_VIDEO_NAME, null)
                 )
@@ -122,7 +122,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setNotificationControlEnabled(enabled: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
-            configManager.setBoolean("notification_control_enabled", enabled)
+            configManager.setBoolean(ConfigManager.KEY_NOTIFICATION_CONTROL_ENABLED, enabled)
             _uiState.update { it.copy(notificationControlEnabled = enabled) }
         }
     }

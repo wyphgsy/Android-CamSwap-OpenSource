@@ -168,8 +168,10 @@ static aaudio_result_t hooked_AAudioStream_read(
         }
         delete[] tempBuf;
     } else {
-        // PCM_I16 — direct replacement
-        fill_fake_pcm(buffer, sizeBytes, info.sampleRate, info.channelCount);
+        // PCM_I16 — direct replacement (only if hook is enabled)
+        int rc = fill_fake_pcm(buffer, sizeBytes, info.sampleRate, info.channelCount);
+        // rc < 0 means hook disabled — leave original buffer untouched
+        (void)rc;
     }
 
     return result;
@@ -220,7 +222,9 @@ static int32_t wrapped_data_callback(
         delete[] tempBuf;
     } else {
         int sizeBytes = framesProcessed * info.channelCount * 2;
-        fill_fake_pcm(audioData, sizeBytes, info.sampleRate, info.channelCount);
+        int rc = fill_fake_pcm(audioData, sizeBytes, info.sampleRate, info.channelCount);
+        // rc < 0 means hook disabled — leave original buffer untouched
+        (void)rc;
     }
 
     return result;

@@ -21,7 +21,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
 
 extern "C"
 JNIEXPORT jboolean JNICALL
-Java_com_example_camswap_NativeAudioHook_nativeInit(JNIEnv* env, jclass clazz) {
+Java_io_github_zensu357_camswap_NativeAudioHook_nativeInit(JNIEnv* env, jclass clazz) {
     LOGI("nativeInit called");
 
     // 在 nativeInit 中初始化 bridge，此时 classloader 上下文正确（Xposed 模块的 classloader）
@@ -36,7 +36,7 @@ Java_com_example_camswap_NativeAudioHook_nativeInit(JNIEnv* env, jclass clazz) {
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_example_camswap_NativeAudioHook_nativeRelease(JNIEnv* /*env*/, jclass /*clazz*/) {
+Java_io_github_zensu357_camswap_NativeAudioHook_nativeRelease(JNIEnv* /*env*/, jclass /*clazz*/) {
     LOGI("nativeRelease called");
     // Dobby hooks persist until process exit; nothing to undo
 }

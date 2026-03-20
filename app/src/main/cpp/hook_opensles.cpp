@@ -109,8 +109,8 @@ static void wrapped_bq_callback(SLAndroidSimpleBufferQueueItf bq, void* context)
         }
     }
 
-    // 先覆盖缓冲区中的真实麦克风数据，再调用原始回调
-    // 这样原始回调读取到的就是假数据，避免时序问题
+    // 先尝试替换缓冲区中的真实麦克风数据
+    // 如果 fill_fake_pcm 返回 < 0 说明 hook 未启用，保留原始数据
     if (info.lastBuffer && info.lastBufferSize > 0) {
         int sampleRate = info.sampleRate / 1000; // milliHz → Hz
         if (sampleRate <= 0) sampleRate = 44100;
@@ -118,6 +118,7 @@ static void wrapped_bq_callback(SLAndroidSimpleBufferQueueItf bq, void* context)
         if (channels <= 0) channels = 1;
 
         fill_fake_pcm(info.lastBuffer, info.lastBufferSize, sampleRate, channels);
+        // return value < 0 means hook disabled — buffer is untouched (passthrough)
     }
 
     // Call original callback — it will see fake data and typically re-enqueue next buffer
