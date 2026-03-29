@@ -287,3 +287,5 @@ API101_MIGRATION_PLAN.md
 .claude/settings.local.json
 .project
 app/bin/build/generated/source/buildConfig/debug/io/github/zensu357/camswap/BuildConfig.class
+memory/MEMORY.md
+memory/project_overview.md

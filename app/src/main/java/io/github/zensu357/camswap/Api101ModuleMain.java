@@ -29,8 +29,12 @@ public class Api101ModuleMain extends XposedModule {
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        String packageKey = param.getPackageName() + "@" + System.identityHashCode(param.getClassLoader());
-        if (!initializedPackages.add(packageKey)) {
+        // Deduplicate by package name only — LINE (and some other apps) trigger
+        // onPackageReady multiple times with different ClassLoader instances,
+        // causing all hooks to be installed twice and every interceptor to fire
+        // double, which leads to resource corruption and native crashes.
+        if (!initializedPackages.add(param.getPackageName())) {
+            LogUtil.log("【CS】跳过重复 onPackageReady: " + param.getPackageName());
             return;
         }
 

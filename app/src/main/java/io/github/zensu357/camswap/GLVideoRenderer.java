@@ -52,6 +52,7 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
     // Input/Output
     private SurfaceTexture mInputSurfaceTexture;
     private Surface mInputSurface;
+    private Surface mTargetSurface; // keep reference for validity checks
 
     // Matrices
     private final float[] mSTMatrix = new float[16];
@@ -89,6 +90,7 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
      */
     public GLVideoRenderer(Surface targetSurface, String tag) {
         mTag = tag;
+        mTargetSurface = targetSurface;
         Matrix.setIdentityM(mRotMatrix, 0);
         Matrix.setIdentityM(mSTMatrix, 0);
 
@@ -159,9 +161,21 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
     private void drawFrame() {
         if (mReleased || !mInitialized)
             return;
+        // Bail out if the target surface has been destroyed to avoid native crash
+        if (mTargetSurface != null && !mTargetSurface.isValid()) {
+            LogUtil.log("【CS】【GL】" + mTag + " target surface 已失效，停止渲染");
+            mReleased = true;
+            return;
+        }
         try {
             renderToBackBuffer();
-            EGL14.eglSwapBuffers(mEGLDisplay, mEGLSurface);
+            if (!EGL14.eglSwapBuffers(mEGLDisplay, mEGLSurface)) {
+                int err = EGL14.eglGetError();
+                LogUtil.log("【CS】【GL】" + mTag + " eglSwapBuffers 失败, err=" + err);
+                if (err == EGL14.EGL_BAD_SURFACE || err == EGL14.EGL_BAD_NATIVE_WINDOW) {
+                    mReleased = true;
+                }
+            }
         } catch (Exception e) {
             LogUtil.log("【CS】【GL】" + mTag + " drawFrame 异常: " + e);
         }

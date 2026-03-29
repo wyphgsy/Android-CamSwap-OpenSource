@@ -260,9 +260,47 @@ public class HookMain {
     }
 
     private void hookImageReaderNewInstance(ClassLoader classLoader) {
-        hookImageReaderNewInstance(classLoader, int.class, int.class, int.class, int.class);
+        // On Android Q+, newInstance(4-param) internally delegates to newInstance(5-param).
+        // Hooking both causes every interceptor to fire twice per call.
+        // Only hook the 5-param version on Q+; on older devices, hook the 4-param version.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             hookImageReaderNewInstance(classLoader, int.class, int.class, int.class, int.class, long.class);
+        } else {
+            hookImageReaderNewInstance(classLoader, int.class, int.class, int.class, int.class);
+        }
+        // Android T+ (API 33): CameraX may use ImageReader.Builder instead of newInstance.
+        // Hook Builder.build() to ensure all ImageReader surfaces are tracked.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            hookImageReaderBuilderBuild(classLoader);
+        }
+    }
+
+    private void hookImageReaderBuilderBuild(ClassLoader classLoader) {
+        try {
+            Class<?> builderClass = Class.forName("android.media.ImageReader$Builder", false, classLoader);
+            Method buildMethod = builderClass.getDeclaredMethod("build");
+            Api101Runtime.requireModule().hook(buildMethod).intercept(chain -> {
+                Object result = chain.proceed(toArgs(chain.getArgs()));
+                try {
+                    if (result instanceof ImageReader) {
+                        ImageReader reader = (ImageReader) result;
+                        Surface surface = reader.getSurface();
+                        if (surface != null && !camera2Hook.shouldSkipImageReaderTracking()) {
+                            int w = reader.getWidth();
+                            int h = reader.getHeight();
+                            int fmt = reader.getImageFormat();
+                            camera2Hook.registerImageReaderSurface(surface, fmt, w, h);
+                            LogUtil.log("【CS】已记录 ImageReader.Builder Surface: "
+                                    + surface + " format=" + fmt + " " + w + "x" + h);
+                        }
+                    }
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】ImageReader.Builder.build after 异常: " + t);
+                }
+                return result;
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook ImageReader.Builder.build 失败 (可能低于 API 33): " + t);
         }
     }
 
@@ -322,7 +360,14 @@ public class HookMain {
 
         if (camera2Hook.shouldBypassYuvAcquireHook(surface)
                 || !camera2Hook.shouldKeepYuvReaderSurfaceForCurrentPackage(surface)) {
-            result = chain.proceed(args);
+            try {
+                result = chain.proceed(args);
+            } catch (UnsupportedOperationException e) {
+                // GL renderer produces RGBA but ImageReader expects YUV — return null
+                // to prevent crash (CameraX handles null from acquireLatestImage).
+                LogUtil.log("【CS】ImageReader acquire 格式不匹配，返回 null: " + e.getMessage());
+                return null;
+            }
         } else {
             try {
                 result = acquireFakeWhatsAppYuvImage(imageReader, surface, args, originInvoker);

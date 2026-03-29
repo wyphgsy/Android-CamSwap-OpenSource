@@ -43,6 +43,10 @@ public final class MediaPlayerManager {
     SurfaceRelay c2_reader_relay;
     SurfaceRelay c2_reader_relay_1;
 
+    // Per-slot surface tracking: skip re-init when surface unchanged
+    private Surface lastC2ReaderSurface, lastC2ReaderSurface1;
+    private Surface lastC2PreviewSurface, lastC2PreviewSurface1;
+
     // ---- Stream mode: single shared ExoPlayerBackend ----
     private SurfacePlayerBackend streamBackend;
 
@@ -93,40 +97,44 @@ public final class MediaPlayerManager {
 
     private void initCamera2PlayersLocal(Surface readerSurface, Surface readerSurface1,
             Surface previewSurface, Surface previewSurface1) {
-        if (readerSurface != null) {
+        if (readerSurface != null && readerSurface != lastC2ReaderSurface) {
             c2_reader_player = recreatePlayer(c2_reader_player);
             GLVideoRenderer[] r = { c2_reader_renderer };
             SurfaceRelay[] rr = { c2_reader_relay };
             setupMediaPlayer(c2_reader_player, r, rr, readerSurface, "c2_reader", false);
             c2_reader_renderer = r[0];
             c2_reader_relay = rr[0];
+            lastC2ReaderSurface = readerSurface;
         }
-        if (readerSurface1 != null) {
+        if (readerSurface1 != null && readerSurface1 != lastC2ReaderSurface1) {
             c2_reader_player_1 = recreatePlayer(c2_reader_player_1);
             GLVideoRenderer[] r = { c2_reader_renderer_1 };
             SurfaceRelay[] rr = { c2_reader_relay_1 };
             setupMediaPlayer(c2_reader_player_1, r, rr, readerSurface1, "c2_reader_1", false);
             c2_reader_renderer_1 = r[0];
             c2_reader_relay_1 = rr[0];
+            lastC2ReaderSurface1 = readerSurface1;
         }
 
         boolean playSound = VideoManager.getConfig().getBoolean(ConfigManager.KEY_PLAY_VIDEO_SOUND, false);
 
-        if (previewSurface != null) {
+        if (previewSurface != null && previewSurface != lastC2PreviewSurface) {
             c2_player = recreatePlayer(c2_player);
             GLVideoRenderer[] r = { c2_renderer };
             SurfaceRelay[] rr = { c2_relay };
             setupMediaPlayer(c2_player, r, rr, previewSurface, "c2_preview", playSound);
             c2_renderer = r[0];
             c2_relay = rr[0];
+            lastC2PreviewSurface = previewSurface;
         }
-        if (previewSurface1 != null) {
+        if (previewSurface1 != null && previewSurface1 != lastC2PreviewSurface1) {
             c2_player_1 = recreatePlayer(c2_player_1);
             GLVideoRenderer[] r = { c2_renderer_1 };
             SurfaceRelay[] rr = { c2_relay_1 };
             setupMediaPlayer(c2_player_1, r, rr, previewSurface1, "c2_preview_1", playSound);
             c2_renderer_1 = r[0];
             c2_relay_1 = rr[0];
+            lastC2PreviewSurface1 = previewSurface1;
         }
         LogUtil.log("【CS】Camera2处理过程完全执行（本地模式）");
     }
@@ -405,6 +413,10 @@ public final class MediaPlayerManager {
         c2_reader_player = null;
         stopAndRelease(c2_player_1);
         c2_player_1 = null;
+        lastC2ReaderSurface = null;
+        lastC2ReaderSurface1 = null;
+        lastC2PreviewSurface = null;
+        lastC2PreviewSurface1 = null;
     }
 
     private void stopAndRelease(MediaPlayer player) {
@@ -457,7 +469,18 @@ public final class MediaPlayerManager {
                     LogUtil.log("【CS】" + tag + " 回退到直接 Surface（无旋转）");
                 }
             }
-            player.setOnPreparedListener(mp -> player.start());
+            player.setOnErrorListener((mp, what, extra) -> {
+                LogUtil.log("【CS】[" + tag + "] MediaPlayer 错误: what=" + what + " extra=" + extra);
+                return true;
+            });
+            player.setOnInfoListener((mp, what, extra) -> {
+                if (what == android.media.MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START
+                        || what == android.media.MediaPlayer.MEDIA_INFO_BUFFERING_START
+                        || what == android.media.MediaPlayer.MEDIA_INFO_BUFFERING_END) {
+                    LogUtil.log("【CS】[" + tag + "] MediaPlayer info: what=" + what);
+                }
+                return false;
+            });
             player.start();
             markCamera2PlaybackStarted(player, tag);
             LogUtil.log("【CS】" + tag + " 已启动播放");

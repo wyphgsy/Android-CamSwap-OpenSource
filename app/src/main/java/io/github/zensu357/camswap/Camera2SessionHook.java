@@ -106,9 +106,14 @@ public final class Camera2SessionHook {
     // Deferred playback: set when build() fires before addTarget()
     volatile boolean pendingPlayback = false;
 
+    // Surface-change tracking: skip redundant initCamera2Players when surfaces unchanged
+    private Surface lastInitReader, lastInitReader1, lastInitPreview, lastInitPreview1;
+
     // Virtual surface for session hijacking
     private Surface virtualSurface;
     private SurfaceTexture virtualTexture;
+    private HandlerThread virtualSurfaceDrainThread;
+    private Handler virtualSurfaceDrainHandler;
     private boolean needRecreate;
     private final ThreadLocal<Integer> fakeYuvAcquireDepth = new ThreadLocal<Integer>() {
         @Override
@@ -209,6 +214,10 @@ public final class Camera2SessionHook {
                     captureBuilder = null;
                     setBypassCurrentSession(false);
                     isFirstHookBuild = true;
+                    lastInitReader = null;
+                    lastInitReader1 = null;
+                    lastInitPreview = null;
+                    lastInitPreview1 = null;
                     LogUtil.log("【CS】打开相机C2");
 
                     File file = new File(VideoManager.getCurrentVideoPath());
@@ -309,6 +318,17 @@ public final class Camera2SessionHook {
             pendingPlayback = true;
             return;
         }
+        // Skip redundant init when surfaces haven't changed since last call
+        if (readerSurface == lastInitReader && readerSurface1 == lastInitReader1
+                && previewSurface == lastInitPreview && previewSurface1 == lastInitPreview1) {
+            LogUtil.log("【CS】跳过重复 startPlayback：surface 未变化");
+            pendingPlayback = false;
+            return;
+        }
+        lastInitReader = readerSurface;
+        lastInitReader1 = readerSurface1;
+        lastInitPreview = previewSurface;
+        lastInitPreview1 = previewSurface1;
         pendingPlayback = false;
         playerManager.initCamera2Players(readerSurface, readerSurface1,
                 previewSurface, previewSurface1);
@@ -455,7 +475,14 @@ public final class Camera2SessionHook {
         if (previewSurface == null) {
             previewSurface = surface;
         } else if (!previewSurface.equals(surface) && previewSurface1 == null) {
-            previewSurface1 = surface;
+            // For non-WhatsApp apps, only use one preview surface to avoid
+            // rendering RGBA to untracked ImageReader surfaces (CameraX apps
+            // like LINE create ImageReaders via Builder which aren't tracked).
+            if (isWhatsAppPackage(getCurrentPackageName())) {
+                previewSurface1 = surface;
+            } else {
+                LogUtil.log("【CS】跳过第二个 preview surface (非 WhatsApp): " + surface);
+            }
         }
         if (pendingPlayback) {
             LogUtil.log("【CS】addTarget 触发延迟播放 (preview)");
@@ -468,6 +495,13 @@ public final class Camera2SessionHook {
             return;
         }
         if (surface == null || shouldKeepRealReaderSurface(surface)) {
+            return;
+        }
+        // Skip YUV ImageReader surfaces for non-WhatsApp apps:
+        // GLVideoRenderer outputs RGBA which causes format mismatch crash
+        // when CameraX acquires images from a YUV_420_888 ImageReader.
+        if (isYuvReaderSurface(surface) && !isWhatsAppPackage(getCurrentPackageName())) {
+            LogUtil.log("【CS】跳过 YUV reader surface 作为播放目标 (非 WhatsApp): " + surface);
             return;
         }
         if (readerSurface == null) {
@@ -521,8 +555,21 @@ public final class Camera2SessionHook {
                 virtualSurface.release();
                 virtualSurface = null;
             }
+            // Ensure a drain thread exists to consume camera HAL frames,
+            // preventing buffer queue stall and native crash.
+            if (virtualSurfaceDrainThread == null) {
+                virtualSurfaceDrainThread = new HandlerThread("CS-VirtualDrain");
+                virtualSurfaceDrainThread.start();
+                virtualSurfaceDrainHandler = new Handler(virtualSurfaceDrainThread.getLooper());
+            }
             virtualTexture = new SurfaceTexture(15);
             virtualTexture.setDefaultBufferSize(1920, 1080);
+            virtualTexture.setOnFrameAvailableListener(st -> {
+                try {
+                    st.updateTexImage();
+                } catch (Exception ignored) {
+                }
+            }, virtualSurfaceDrainHandler);
             virtualSurface = new Surface(virtualTexture);
             needRecreate = false;
         } else {
